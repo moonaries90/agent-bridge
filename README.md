@@ -4,7 +4,7 @@
 
 [中文文档](README.zh-CN.md)
 
-> **Acknowledgement.** This repository (`agent-collaboration`) is a personal, heavily modified
+> **Acknowledgement.** This repository (`agent-bridge`) is a personal, heavily modified
 > fork of [**AgentBridge** by Rayson (@raysonmeng)](https://github.com/raysonmeng/agent-bridge),
 > created with deep respect for the original author's work. Because the changes diverge
 > substantially from upstream — turning a Claude⇄Codex bridge into a multi-agent one (adding
@@ -119,8 +119,8 @@ multi-agent fork.)
 
 ```bash
 # 1. Clone and install dependencies
-git clone https://github.com/moonaries90/agent-collaboration.git
-cd agent-collaboration
+git clone https://github.com/moonaries90/agent-bridge.git
+cd agent-bridge
 bun install
 bun link
 
@@ -231,7 +231,7 @@ code changes and report completed work, leaving the git workflow to the side tha
 
 AgentBridge was created and open-sourced by **[Rayson (@raysonmeng)](https://github.com/raysonmeng)**
 under the MIT license — including the original Claude⇄Codex bridge, the two-process daemon design,
-and the plugin/CLI scaffolding this fork builds on. This `agent-collaboration` repository simply
+and the plugin/CLI scaffolding this fork builds on. This `agent-bridge` repository simply
 would not exist without it. Enormous thanks to the original author for designing AgentBridge and
 sharing it with the community.
 

@@ -30,11 +30,11 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/moonaries90/agent-collaboration.git"
+    "url": "https://github.com/moonaries90/agent-bridge.git"
   },
-  "homepage": "https://github.com/moonaries90/agent-collaboration#readme",
+  "homepage": "https://github.com/moonaries90/agent-bridge#readme",
   "bugs": {
-    "url": "https://github.com/moonaries90/agent-collaboration/issues"
+    "url": "https://github.com/moonaries90/agent-bridge/issues"
   },
   "keywords": [
     "claude-code",
