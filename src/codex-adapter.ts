@@ -1,0 +1,1776 @@
+/**
+ * Codex Adapter — App-Server Proxy Mode
+ *
+ * Spawns `codex app-server --listen stdio://` and runs a WebSocket proxy.
+ * Codex TUI connects to the proxy; Bridge forwards all traffic while
+ * intercepting agentMessages for Claude.
+ *
+ * Codex 0.131 removed `ws://` as an app-server listen transport. The TUI
+ * still supports `--remote ws://...`, so AgentBridge keeps its own WebSocket
+ * proxy and talks to the real Codex app-server over JSON-lines stdio.
+ */
+
+import { spawn, execSync, type ChildProcess } from "node:child_process";
+import { createInterface } from "node:readline";
+import { EventEmitter } from "node:events";
+import { appendFileSync } from "node:fs";
+import { StateDirResolver } from "./state-dir";
+import type { BridgeMessage } from "./types";
+import type { ServerWebSocket } from "bun";
+import {
+  isAppServerNotification,
+  isAppServerRequestMessage,
+  isAppServerResponseMessage,
+  isTrackedAppServerRequestMethod,
+  type AppServerItem,
+  type AppServerNotification,
+  type AppServerRequest,
+  type AppServerResponse,
+  type AppServerServerRequestMethod,
+  type AppServerTrackedRequestMethod,
+  type TurnStartParams,
+  type TurnSteerParams,
+} from "./app-server-protocol";
+
+interface TuiSocketData {
+  connId: number;
+}
+
+interface AppServerMessageEvent {
+  data: string;
+}
+
+interface AppServerCloseEvent {
+  code: number | null;
+  reason: string;
+}
+
+interface AppServerConnection {
+  readyState: number;
+  onopen: (() => void) | null;
+  onmessage: ((event: AppServerMessageEvent) => void) | null;
+  onerror: ((error?: unknown) => void) | null;
+  onclose: ((event: AppServerCloseEvent) => void) | null;
+  send(data: string): void;
+  close(): void;
+}
+
+class StdioAppServerConnection implements AppServerConnection {
+  readyState: number = WebSocket.CONNECTING;
+  onopen: (() => void) | null = null;
+  onmessage: ((event: AppServerMessageEvent) => void) | null = null;
+  onerror: ((error?: unknown) => void) | null = null;
+  onclose: ((event: AppServerCloseEvent) => void) | null = null;
+
+  private readonly child: ChildProcess;
+  private closed = false;
+
+  constructor(private readonly log: (msg: string) => void, extraArgs: string[] = [], workDir?: string) {
+    this.child = spawn("codex", ["app-server", "--listen", "stdio://", ...extraArgs], {
+      stdio: ["pipe", "pipe", "pipe"],
+      cwd: workDir, // undefined → inherit; set so the agent runs in the user's cwd, not the daemon's
+    });
+
+    this.child.on("error", (err) => {
+      this.log(`[codex-server] failed to start: ${err.message}`);
+      this.onerror?.(err);
+      this.finishClose(null, err.message);
+    });
+
+    this.child.on("exit", (code, signal) => {
+      this.finishClose(code, signal ? `signal ${signal}` : `exit ${code ?? "unknown"}`);
+    });
+
+    if (this.child.stdout) {
+      const stdoutRl = createInterface({ input: this.child.stdout });
+      stdoutRl.on("line", (line) => {
+        this.onmessage?.({ data: line });
+      });
+    }
+
+    if (this.child.stderr) {
+      const stderrRl = createInterface({ input: this.child.stderr });
+      stderrRl.on("line", (line) => this.log(`[codex-server] ${line}`));
+    }
+
+    queueMicrotask(() => {
+      if (this.readyState !== WebSocket.CONNECTING) return;
+      this.readyState = WebSocket.OPEN;
+      this.onopen?.();
+    });
+  }
+
+  send(data: string): void {
+    if (this.readyState !== WebSocket.OPEN || !this.child.stdin?.writable) {
+      throw new Error("Codex app-server stdio is not open");
+    }
+    this.child.stdin.write(data.endsWith("\n") ? data : `${data}\n`);
+  }
+
+  close(): void {
+    if (this.closed || this.readyState === WebSocket.CLOSED) return;
+    this.readyState = WebSocket.CLOSING;
+    try { this.child.stdin?.end(); } catch {}
+    try { this.child.kill("SIGTERM"); } catch {}
+    const killTimer = setTimeout(() => {
+      try { this.child.kill("SIGKILL"); } catch {}
+    }, 2000);
+    this.child.once("exit", () => clearTimeout(killTimer));
+  }
+
+  private finishClose(code: number | null, reason: string): void {
+    if (this.closed) return;
+    this.closed = true;
+    this.readyState = WebSocket.CLOSED;
+    this.onclose?.({ code, reason });
+  }
+}
+
+interface PendingServerRequest {
+  raw: string;
+  serverId: number | string;
+  connId: number;
+  method: AppServerServerRequestMethod | string;
+  timestamp: number;
+  threadId: string | null;
+}
+
+interface BufferedServerRequest {
+  raw: string;
+  serverId: number | string;
+  method: AppServerServerRequestMethod | string;
+  threadId: string | null;
+}
+
+interface PendingServerResponse {
+  raw: string;
+  serverId: number | string;
+  method: AppServerServerRequestMethod | string;
+  timestamp: number;
+}
+
+interface PendingRequest {
+  method: AppServerTrackedRequestMethod;
+  threadId?: string;
+}
+
+export class CodexAdapter extends EventEmitter {
+  private static readonly RESPONSE_TRACKING_TTL_MS = 30000;
+
+  private appServerWs: AppServerConnection | null = null;
+  private tuiWs: ServerWebSocket<TuiSocketData> | null = null;
+  private proxyServer: ReturnType<typeof Bun.serve> | null = null;
+  private stopped = false;
+  private threadId: string | null = null;
+  // Reserve negative ids for bridge-originated requests so they never collide
+  // with proxy-rewritten TUI request ids.
+  private nextInjectionId = -1;
+  private appPort: number;
+  private proxyPort: number;
+  private readonly logFile: string;
+  // Extra args appended to `codex app-server --listen stdio://` when this adapter
+  // spawns the app-server. Used by the controller-side middleman to mount the
+  // agentbridge MCP (reply tool) on the controller Codex agent WITHOUT polluting
+  // the global ~/.codex/config.toml. Empty for the peer-side adapter.
+  private readonly appServerArgs: string[];
+  // cwd for the spawned codex app-server. Needed because the daemon may run in a
+  // different directory (the state dir, via the codex-kimi/zcode chdir workaround)
+  // than the user's actual working directory.
+  private readonly workDir?: string;
+  private tuiConnId = 0; // tracks which TUI connection is "current" (primary)
+  private connIdCounter = 0; // monotonically increasing counter for unique conn IDs
+  // Secondary (picker) connections: each gets its own dedicated app-server WS
+  // for raw passthrough. The primary connection stays untouched.
+  private secondaryConnections = new Map<number, {
+    tuiWs: ServerWebSocket<TuiSocketData>;
+    appServerWs: AppServerConnection | null;
+    buffer: string[];
+  }>();
+
+  private agentMessageBuffers = new Map<string, string[]>();
+  private pendingRequests = new Map<string, PendingRequest>();
+  private activeTurnIds = new Set<string>();
+  turnInProgress = false;
+
+  // Proxy-layer id rewriting: upstream uses globally unique ids
+  private nextProxyId = 100000;
+  private upstreamToClient = new Map<number, { connId: number; clientId: number | string }>();
+  private serverRequestToProxy = new Map<number, PendingServerRequest>();
+  private pendingServerRequests: BufferedServerRequest[] = [];
+  private pendingServerResponses = new Map<number, PendingServerResponse>();
+  private staleProxyIds = new Map<number, ReturnType<typeof setTimeout>>();
+  private bridgeRequestIds = new Map<number, ReturnType<typeof setTimeout>>();
+  private intentionalDisconnect = false;
+  // Fresh-session reconnection: buffer TUI messages while reconnecting app-server
+  private pendingTuiMessages: string[] = [];
+  private reconnectingForNewSession = false;
+  private replayingBufferedMessages = false;
+  // Generation counter to prevent stale app-server close handlers from interfering
+  private appServerGeneration = 0;
+
+  // Outage recovery window — when app-server is unintentionally down, buffer
+  // outbound TUI messages briefly so short upstream blips don't kill the TUI.
+  // If the outage runs past OUTAGE_TIMEOUT_MS or the queue overflows, we
+  // fail-fast by closing the TUI WS with code 1011 so codex-rs raises a
+  // visible FatalExitRequest rather than hanging silently.
+  private outageQueue: Array<{ raw: string; connId: number }> = [];
+  private outageTimer: ReturnType<typeof setTimeout> | null = null;
+  private static readonly OUTAGE_QUEUE_MAX = 64;
+  private static readonly OUTAGE_TIMEOUT_MS = 5000;
+
+  // Session-state capture for unintentional-reconnect replay.
+  //
+  // When the upstream app-server drops unexpectedly and we silently
+  // reconnect, the new session has no knowledge of initialize/thread
+  // state. The TUI doesn't know the reconnect happened and continues
+  // using its stale session. The first request that requires
+  // initialized state (e.g. turn/steer) gets `"Not initialized"`,
+  // codex-rs exits with `Error: turn/steer failed: Not initialized`.
+  //
+  // To avoid that, we capture the TUI's initialize/initialized payloads
+  // and replay them against the fresh app-server session on
+  // unintentional reconnect. See handleSessionRestoreAfterReconnect.
+  private lastInitializeRaw: string | null = null;
+  private lastInitializedRaw: string | null = null;
+  private sessionRestoreInProgress = false;
+  private replayPending = new Map<number | string, {
+    method: string;
+    resolve: (response: unknown) => void;
+    reject: (err: Error) => void;
+    timer: ReturnType<typeof setTimeout>;
+  }>();
+  private static readonly SESSION_REPLAY_TIMEOUT_MS = 5000;
+
+  constructor(
+    appPort = 4500,
+    proxyPort = 4501,
+    logFile = new StateDirResolver().logFile,
+    appServerArgs: string[] = [],
+    workDir?: string,
+  ) {
+    super();
+    this.appPort = appPort;
+    this.proxyPort = proxyPort;
+    this.logFile = logFile;
+    this.appServerArgs = appServerArgs;
+    this.workDir = workDir;
+  }
+
+  get appServerUrl() { return "stdio://"; }
+  get proxyUrl() { return `ws://127.0.0.1:${this.proxyPort}`; }
+  get activeThreadId() { return this.threadId; }
+
+  // ── Lifecycle ──────────────────────────────────────────────
+
+  async start() {
+    this.stopped = false;
+    this.intentionalDisconnect = false;
+    await this.checkPorts();
+    this.log("Spawning codex app-server over stdio");
+
+    // Connect to app-server once, keep it alive permanently
+    await this.connectToAppServer();
+
+    this.startProxy();
+    this.log(`Proxy ready on ${this.proxyUrl}`);
+  }
+
+  /** Disconnect the bridge (proxy + app-server WS) without killing the Codex process. */
+  disconnect() {
+    this.intentionalDisconnect = true;
+
+    // Cancel any pending reconnect
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+
+    // Cancel any outage recovery in flight
+    this.outageQueue = [];
+    this.clearOutageTimer();
+
+    this.appServerWs?.close();
+    this.appServerWs = null;
+    // Close all secondary (picker) connections
+    for (const [id, sec] of this.secondaryConnections) {
+      try { sec.appServerWs?.close(); } catch {}
+      this.secondaryConnections.delete(id);
+    }
+    this.proxyServer?.stop();
+    this.proxyServer = null;
+    this.clearResponseTrackingState();
+  }
+
+  /** Fully stop: disconnect bridge AND kill the Codex process. */
+  stop() {
+    this.stopped = true;
+    this.intentionalDisconnect = true;
+    this.disconnect();
+  }
+
+  /** Inject a message into the active Codex thread via turn/start. Returns true if sent. */
+  injectMessage(text: string): boolean {
+    if (!this.threadId) {
+      this.log("Cannot inject: no active thread");
+      return false;
+    }
+    if (!this.appServerWs || this.appServerWs.readyState !== WebSocket.OPEN) {
+      this.log("Cannot inject: app-server WebSocket not connected");
+      return false;
+    }
+    if (this.turnInProgress) {
+      this.log(`Rejected injection: Codex turn is in progress (thread ${this.threadId})`);
+      return false;
+    }
+    this.log(`Injecting message into Codex (${text.length} chars)`);
+    const requestId = this.nextInjectionId--;
+    this.trackBridgeRequestId(requestId);
+    try {
+      this.appServerWs.send(JSON.stringify({
+        method: "turn/start",
+        id: requestId,
+        params: { threadId: this.threadId, input: [{ type: "text", text }] },
+      } satisfies AppServerRequest<"turn/start", TurnStartParams>));
+      return true;
+    } catch (err: any) {
+      this.untrackBridgeRequestId(requestId);
+      this.log(`Injection send failed: ${err.message}`);
+      return false;
+    }
+  }
+
+  /** Most recent real (non-placeholder) active turn id, or null. */
+  private currentActiveTurnId(): string | null {
+    let found: string | null = null;
+    for (const id of this.activeTurnIds) {
+      if (!id.startsWith("unknown:")) found = id; // Set preserves insertion order
+    }
+    return found;
+  }
+
+  /**
+   * Inject text into the CURRENTLY ACTIVE turn via turn/steer (vs. injectMessage
+   * which uses turn/start and is rejected mid-turn). Lets a peer reply reach the
+   * controller even while it is busy, so delivery never depends on the agent
+   * choosing to go idle.
+   *
+   * Awaits the server response: resolves true if accepted, false if there is no
+   * active turn, the socket is down, or the server rejects it (e.g. the turn
+   * ended between our check and the send — `expectedTurnId` no longer matches).
+   * On false the caller should keep the message queued for a later turn/start.
+   */
+  async steerMessage(text: string): Promise<boolean> {
+    if (!this.threadId) return false;
+    if (!this.appServerWs || this.appServerWs.readyState !== WebSocket.OPEN) return false;
+    const expectedTurnId = this.currentActiveTurnId();
+    if (!expectedTurnId) return false;
+    const requestId = this.nextInjectionId--;
+    const raw = JSON.stringify({
+      method: "turn/steer",
+      id: requestId,
+      params: { threadId: this.threadId, input: [{ type: "text", text }], expectedTurnId },
+    } satisfies AppServerRequest<"turn/steer", TurnSteerParams>);
+    this.log(`Steering message into active turn ${expectedTurnId} (${text.length} chars)`);
+    try {
+      await this.sendReplayAndAwait(raw, "turn/steer");
+      return true;
+    } catch (err: any) {
+      this.log(`turn/steer failed (${err.message}); falling back to queued turn/start`);
+      return false;
+    }
+  }
+
+  // ── Persistent App-Server Connection ───────────────────────
+
+  private connectToAppServer(isReconnect = false): Promise<void> {
+    const generation = ++this.appServerGeneration;
+    return new Promise((resolve, reject) => {
+      const appWs = this.createAppServerConnection();
+      let opened = false;
+
+      appWs.onopen = () => {
+        if (this.appServerGeneration !== generation) {
+          appWs.close();
+          return;
+        }
+        opened = true;
+        this.appServerWs = appWs;
+        this.intentionalDisconnect = false;
+        this.reconnectAttempts = 0;
+        this.log(isReconnect ? "Reconnected to app-server" : "Connected to app-server");
+        this.flushPendingServerResponses();
+        // On unintentional reconnect, restore session state (cached
+        // initialize / thread/resume) BEFORE draining any TUI messages
+        // that might require an initialized session. On first connect,
+        // there's no state to restore so drain immediately.
+        if (isReconnect) {
+          this.handleSessionRestoreAfterReconnect()
+            .finally(() => this.drainOutageQueue())
+            .catch((e: unknown) => {
+              const m = e instanceof Error ? e.message : String(e);
+              this.log(`session restore unexpected error: ${m}`);
+            });
+        } else {
+          this.drainOutageQueue();
+        }
+        resolve();
+      };
+
+      appWs.onmessage = (event) => {
+        if (this.appServerGeneration !== generation) return;
+        const data = event.data;
+
+        const forwarded = this.handleAppServerPayload(data);
+        if (forwarded === null) return;
+
+        // Forward to current TUI connection
+        if (this.tuiWs) {
+          try { this.tuiWs.send(forwarded); } catch (e: any) {
+            this.log(`Failed to forward message to TUI: ${e.message}`);
+          }
+        } else {
+          this.log("WARNING: response from app-server but no TUI connected, message dropped");
+        }
+      };
+
+      appWs.onerror = () => {
+        if (this.appServerGeneration !== generation) return;
+        this.log("App-server connection error");
+        if (!isReconnect) reject(new Error("Failed to connect to app-server"));
+      };
+
+      appWs.onclose = (event) => {
+        if (this.appServerGeneration !== generation) return;
+        if (!opened && !isReconnect) {
+          reject(new Error(`Codex app-server closed before opening: ${event.reason}`));
+          return;
+        }
+        this.handleAppServerClose();
+      };
+    });
+  }
+
+  private createAppServerConnection(): AppServerConnection {
+    return new StdioAppServerConnection((msg) => this.log(msg), this.appServerArgs, this.workDir);
+  }
+
+  /** Reconnect app-server WS to give TUI a fresh connection-scoped session. */
+  private async reconnectAppServerForNewSession(tuiWs: ServerWebSocket<TuiSocketData>) {
+    // Bump generation so stale handlers from the old connection become no-ops
+    this.appServerGeneration++;
+    this.intentionalDisconnect = true;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+
+    // Close old connection
+    const oldWs = this.appServerWs;
+    this.appServerWs = null;
+    if (oldWs) {
+      try { oldWs.close(); } catch {}
+    }
+
+    // Clear connection-scoped state (upstreamToClient etc.) but preserve
+    // pendingServerRequests — those must survive the intentional reconnect
+    // so they can be replayed after the TUI completes thread/resume.
+    this.clearResponseTrackingStateForAppServerReconnect();
+    this.activeTurnIds.clear();
+    this.turnInProgress = false;
+
+    try {
+      await this.connectToAppServer(false);
+      this.log("App-server reconnected for new TUI session — replaying buffered messages");
+
+      // Replay raw buffered messages through onTuiMessage so they get
+      // proper id-rewriting and response tracking on the fresh connection.
+      const messages = this.pendingTuiMessages;
+      this.pendingTuiMessages = [];
+      this.reconnectingForNewSession = false;
+
+      this.replayingBufferedMessages = true;
+      try {
+        for (const msg of messages) {
+          this.onTuiMessage(tuiWs, msg);
+        }
+      } finally {
+        this.replayingBufferedMessages = false;
+      }
+    } catch (err: any) {
+      this.log(`Failed to reconnect app-server for new session: ${err.message}`);
+      this.pendingTuiMessages = [];
+      this.reconnectingForNewSession = false;
+      this.intentionalDisconnect = false;
+      this.scheduleReconnect();
+    }
+  }
+
+  // ── Auto-Reconnect ──────────────────────────────────────────
+
+  private reconnectAttempts = 0;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private static readonly MAX_RECONNECT_ATTEMPTS = 10;
+  private static readonly RECONNECT_BASE_DELAY_MS = 1000;
+
+  private scheduleReconnect() {
+    if (this.stopped) return;
+
+    if (this.reconnectAttempts >= CodexAdapter.MAX_RECONNECT_ATTEMPTS) {
+      this.log(`App-server reconnect failed after ${this.reconnectAttempts} attempts. Giving up.`);
+      this.emit("error", new Error("App-server connection lost and reconnect failed"));
+      return;
+    }
+
+    const delay = Math.min(
+      CodexAdapter.RECONNECT_BASE_DELAY_MS * Math.pow(2, this.reconnectAttempts),
+      30000,
+    );
+    this.reconnectAttempts++;
+    this.log(`Scheduling app-server reconnect attempt ${this.reconnectAttempts}/${CodexAdapter.MAX_RECONNECT_ATTEMPTS} in ${delay}ms...`);
+
+    this.reconnectTimer = setTimeout(async () => {
+      try {
+        await this.connectToAppServer(true);
+        this.log("App-server reconnect successful");
+      } catch {
+        this.log("App-server reconnect attempt failed");
+        this.scheduleReconnect();
+      }
+    }, delay);
+  }
+
+  private handleAppServerClose() {
+    // Extra detail helps diagnose the "TUI silent exit" path: if app-server
+    // closes first (upstream-side failure) and TUI sends anything afterwards,
+    // the outage queue absorbs the blow for up to OUTAGE_TIMEOUT_MS; after
+    // that we close the TUI with 1011 so codex-rs raises a visible
+    // FatalExitRequest. The timestamp here pairs with codex-wrapper.log.
+    const intentional = this.intentionalDisconnect;
+    const tuiConnected = this.tuiWs !== null;
+    this.log(
+      `App-server connection closed (intentional=${intentional}, tuiConnected=${tuiConnected}, turnInProgress=${this.turnInProgress})`,
+    );
+    this.appServerWs = null;
+    // Approval request/response ids are scoped to the current app-server session.
+    // If the socket reconnects, replaying old approval state would forward stale ids.
+    this.clearResponseTrackingState();
+    this.activeTurnIds.clear();
+    this.turnInProgress = false;
+    if (!intentional) {
+      this.scheduleReconnect();
+    }
+  }
+
+  // ── Outage recovery queue ─────────────────────────────────────
+
+  /**
+   * Buffer a TUI → app-server message during an upstream outage.
+   *
+   * Called when `onTuiMessage` would otherwise silently drop the message.
+   * Starts a fail-fast timer on first use; overflows close the TUI with
+   * 1011. The buffer is drained in-order when app-server reconnects.
+   */
+  private bufferDuringOutage(ws: ServerWebSocket<TuiSocketData>, raw: string): void {
+    if (this.outageQueue.length >= CodexAdapter.OUTAGE_QUEUE_MAX) {
+      this.log(
+        `ERROR: outage queue overflow (${this.outageQueue.length}/${CodexAdapter.OUTAGE_QUEUE_MAX}) — closing TUI with 1011`,
+      );
+      this.outageQueue = [];
+      this.clearOutageTimer();
+      if (this.tuiWs && this.tuiWs === ws) {
+        try {
+          ws.close(1011, "agentbridge: app-server unavailable; pending TUI queue overflow");
+        } catch (e: any) {
+          this.log(`Failed to close TUI WS after outage queue overflow: ${e.message}`);
+        }
+      }
+      return;
+    }
+
+    this.outageQueue.push({ raw, connId: ws.data.connId });
+    this.log(
+      `DIAGNOSTIC: buffered TUI message while app-server unavailable (queue size=${this.outageQueue.length}/${CodexAdapter.OUTAGE_QUEUE_MAX})`,
+    );
+    this.ensureOutageTimer();
+  }
+
+  private ensureOutageTimer(): void {
+    if (this.outageTimer !== null) return;
+    this.outageTimer = setTimeout(() => {
+      this.outageTimer = null;
+      const buffered = this.outageQueue.length;
+      this.outageQueue = [];
+      this.log(
+        `ERROR: app-server did not return within ${CodexAdapter.OUTAGE_TIMEOUT_MS}ms (buffered=${buffered}) — closing TUI with 1011`,
+      );
+      const ws = this.tuiWs;
+      if (ws) {
+        try {
+          ws.close(
+            1011,
+            `agentbridge: app-server unavailable after ${CodexAdapter.OUTAGE_TIMEOUT_MS}ms; buffered=${buffered}`,
+          );
+        } catch (e: any) {
+          this.log(`Failed to close TUI WS on outage timeout: ${e.message}`);
+        }
+      }
+    }, CodexAdapter.OUTAGE_TIMEOUT_MS);
+  }
+
+  private clearOutageTimer(): void {
+    if (this.outageTimer !== null) {
+      clearTimeout(this.outageTimer);
+      this.outageTimer = null;
+    }
+  }
+
+  // ── Session restore after unintentional reconnect ────────────
+
+  /**
+   * Restore codex-rs session state on the fresh app-server WS.
+   *
+   * Flow:
+   *   1. If no cached initialize, bail (no-op, usually because the
+   *      reconnect happened before the TUI's initial handshake).
+   *   2. Send cached initialize, await response by id.
+   *   3. Send cached `initialized` notification (fire-and-forget).
+   *   4. If we know an active threadId, send `thread/resume` and await.
+   *   5. On any failure, close the TUI with 1011 so codex-rs surfaces a
+   *      visible FatalExitRequest instead of deadlocking on the next
+   *      `"Not initialized"` response.
+   *
+   * Open questions for Codex source review:
+   *   - Is `initialize` idempotent in codex app-server?
+   *   - Does `thread/resume` work against a fresh session, or must it
+   *     follow a session handshake specific to the thread's creator?
+   *   - Are there session-unique fields in initialize that would cause
+   *     replay to be rejected?
+   * See docs/issues-2026-04-24-codex-not-initialized-after-silent-reconnect.md.
+   */
+  private async handleSessionRestoreAfterReconnect(): Promise<void> {
+    if (!this.lastInitializeRaw) {
+      this.log("DIAGNOSTIC: no cached initialize to replay after unintentional reconnect");
+      return;
+    }
+    if (!this.appServerWs || this.appServerWs.readyState !== WebSocket.OPEN) {
+      this.log("DIAGNOSTIC: app-server not open at session restore start — skipping");
+      return;
+    }
+
+    this.sessionRestoreInProgress = true;
+    try {
+      this.log(
+        `DIAGNOSTIC: replaying cached initialize to restore session (threadId=${this.threadId ?? "none"})`,
+      );
+      await this.sendReplayAndAwait(this.lastInitializeRaw, "initialize");
+
+      if (this.lastInitializedRaw && this.appServerWs.readyState === WebSocket.OPEN) {
+        this.appServerWs.send(this.lastInitializedRaw);
+      }
+
+      if (this.threadId && this.appServerWs.readyState === WebSocket.OPEN) {
+        const replayId = `agentbridge-replay-thread-resume-${Date.now()}`;
+        const resumeRaw = JSON.stringify({
+          jsonrpc: "2.0",
+          id: replayId,
+          method: "thread/resume",
+          params: { threadId: this.threadId },
+        });
+        await this.sendReplayAndAwait(resumeRaw, "thread/resume");
+      }
+
+      this.log(
+        `DIAGNOSTIC: session restored after unintentional reconnect (threadId=${this.threadId ?? "none"})`,
+      );
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.log(
+        `ERROR: session restore failed (${msg}) — closing TUI with 1011`,
+      );
+      const tuiWs = this.tuiWs;
+      if (tuiWs) {
+        try {
+          tuiWs.close(1011, `agentbridge: session restore failed: ${msg}`);
+        } catch (closeErr: unknown) {
+          const cm = closeErr instanceof Error ? closeErr.message : String(closeErr);
+          this.log(`Failed to close TUI after session restore failure: ${cm}`);
+        }
+      }
+    } finally {
+      this.sessionRestoreInProgress = false;
+    }
+  }
+
+  /**
+   * Send a raw JSON-RPC payload to app-server and await the response by id.
+   *
+   * Short-circuits the normal response handler via `replayPending`, so the
+   * response is captured here and NOT forwarded to the TUI (which would
+   * confuse it — the TUI didn't send this request). Rejects on timeout
+   * or if the response carries an `error` field.
+   */
+  private sendReplayAndAwait(raw: string, method: string): Promise<unknown> {
+    if (!this.appServerWs || this.appServerWs.readyState !== WebSocket.OPEN) {
+      return Promise.reject(new Error("app-server not open"));
+    }
+    let id: number | string;
+    try {
+      const parsed = JSON.parse(raw) as { id?: number | string };
+      if (parsed.id === undefined) {
+        return Promise.reject(new Error(`replay payload for ${method} has no id`));
+      }
+      id = parsed.id;
+    } catch (e: unknown) {
+      const m = e instanceof Error ? e.message : String(e);
+      return Promise.reject(new Error(`replay parse failed for ${method}: ${m}`));
+    }
+
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.replayPending.delete(id);
+        reject(new Error(`replay timeout (${CodexAdapter.SESSION_REPLAY_TIMEOUT_MS}ms) for ${method} id=${JSON.stringify(id)}`));
+      }, CodexAdapter.SESSION_REPLAY_TIMEOUT_MS);
+
+      this.replayPending.set(id, { method, resolve, reject, timer });
+      try {
+        this.appServerWs!.send(raw);
+      } catch (e: unknown) {
+        clearTimeout(timer);
+        this.replayPending.delete(id);
+        const m = e instanceof Error ? e.message : String(e);
+        reject(new Error(`replay send failed for ${method}: ${m}`));
+      }
+    });
+  }
+
+  /**
+   * Intercept an app-server response that matches a pending replay.
+   *
+   * Returns true if the response was consumed (and should NOT be forwarded
+   * to TUI). Returns false if no replay is awaiting this id.
+   */
+  private tryConsumeReplayResponse(payload: Record<string, unknown>): boolean {
+    const id = payload.id;
+    if (id === undefined) return false;
+    const pending = this.replayPending.get(id as number | string);
+    if (!pending) return false;
+
+    clearTimeout(pending.timer);
+    this.replayPending.delete(id as number | string);
+
+    if (payload.error !== undefined) {
+      const errMsg = typeof payload.error === "object" && payload.error !== null && "message" in payload.error
+        ? String((payload.error as { message?: unknown }).message ?? "unknown")
+        : JSON.stringify(payload.error);
+      pending.reject(new Error(`${pending.method} rejected: ${errMsg}`));
+    } else {
+      pending.resolve(payload);
+    }
+    return true;
+  }
+
+  /**
+   * Replay the outage queue after app-server reconnects.
+   *
+   * Messages are replayed in original order. We stored RAW TUI bytes
+   * (pre-rewrite), so re-entering `onTuiMessage` produces a fresh proxy id
+   * and a fresh `upstreamToClient` mapping against the new app-server
+   * session — avoiding the response-tracking race where the original
+   * mapping was wiped by `clearResponseTrackingState` on close.
+   */
+  private drainOutageQueue(): void {
+    if (this.outageQueue.length === 0) {
+      this.clearOutageTimer();
+      return;
+    }
+    if (!this.appServerWs || this.appServerWs.readyState !== WebSocket.OPEN) return;
+    const ws = this.tuiWs;
+    if (!ws) {
+      // TUI disconnected between buffer and drain — safe to discard.
+      this.outageQueue = [];
+      this.clearOutageTimer();
+      return;
+    }
+
+    const messages = this.outageQueue;
+    this.outageQueue = [];
+    this.clearOutageTimer();
+    this.log(
+      `DIAGNOSTIC: replaying ${messages.length} buffered TUI messages after app-server reconnect`,
+    );
+    for (const msg of messages) {
+      try {
+        // Re-enter the full TUI message pipeline so rewriting and tracking
+        // run against the fresh app-server session.
+        this.onTuiMessage(ws, msg.raw);
+      } catch (e: any) {
+        this.log(`Failed to replay buffered TUI message (conn #${msg.connId}): ${e.message}`);
+      }
+    }
+  }
+
+  // ── Proxy Server ───────────────────────────────────────────
+
+  private startProxy() {
+    const self = this;
+    this.proxyServer = Bun.serve({
+      port: this.proxyPort,
+      hostname: "127.0.0.1",
+      fetch(req, server) {
+        const url = new URL(req.url);
+        const isUpgrade = req.headers.get("upgrade")?.toLowerCase() === "websocket";
+        self.log(`HTTP ${req.method} ${url.pathname} (upgrade=${isUpgrade})`);
+        if (url.pathname === "/healthz" || url.pathname === "/readyz") {
+          return Response.json({
+            ok: self.appServerWs?.readyState === WebSocket.OPEN,
+            appServerUrl: self.appServerUrl,
+            proxyUrl: self.proxyUrl,
+          });
+        }
+        if (server.upgrade(req, { data: { connId: 0 } })) return undefined;
+        self.log(`WARNING: non-upgrade HTTP request not handled: ${req.method} ${url.pathname}`);
+        return new Response("AgentBridge Codex Proxy");
+      },
+      websocket: {
+        open: (ws: ServerWebSocket<TuiSocketData>) => self.onTuiConnect(ws),
+        close: (ws: ServerWebSocket<TuiSocketData>, code: number, reason: string) => {
+          self.log(`WebSocket close event: conn #${ws.data.connId}, code=${code}, reason=${reason || "none"}`);
+          self.onTuiDisconnect(ws);
+        },
+        message: (ws: ServerWebSocket<TuiSocketData>, msg) => self.onTuiMessage(ws, msg),
+      },
+    });
+  }
+
+  private onTuiConnect(ws: ServerWebSocket<TuiSocketData>) {
+    const connId = ++this.connIdCounter;
+    ws.data.connId = connId;
+
+    // If a primary TUI connection is still alive, this is a secondary (picker)
+    // connection. The Codex TUI opens a parallel WS for the resume picker while
+    // the main session connection stays open. Give the secondary its own
+    // app-server WS so the primary is not disturbed.
+    if (this.tuiWs) {
+      this.log(`Secondary TUI connected (conn #${connId}, primary is #${this.tuiConnId})`);
+      this.setupSecondaryConnection(ws, connId);
+      return;
+    }
+
+    // No active primary — this becomes the new primary connection
+    const previousConnId = this.tuiConnId > 0 ? this.tuiConnId : null;
+    this.tuiConnId = connId;
+    this.tuiWs = ws;
+    // Reset threadId to prevent premature message injection before TUI completes
+    // its handshake (initialize → thread/start or thread/resume).
+    this.threadId = null;
+    this.log(`TUI connected (conn #${this.tuiConnId})`);
+    this.emit("tuiConnected", this.tuiConnId);
+    if (previousConnId !== null) {
+      this.retireConnectionState(previousConnId);
+    }
+    // Do not replay pendingServerRequests here — defer until TUI completes its
+    // handshake (thread/resume to matching thread, or thread/start which drops
+    // orphan entries). See handleTrackedResponse and dropOrphanPendingRequests.
+  }
+
+  /** Set up a secondary (picker) connection with its own dedicated app-server WS. */
+  private setupSecondaryConnection(ws: ServerWebSocket<TuiSocketData>, connId: number) {
+    const appWs = this.createAppServerConnection();
+    // Store the appWs handle immediately (not just in onopen) so that
+    // onTuiDisconnect can close it even if the picker disconnects before
+    // the app-server WS finishes connecting.
+    const entry = { tuiWs: ws, appServerWs: appWs, buffer: [] as string[] };
+    this.secondaryConnections.set(connId, entry);
+
+    appWs.onopen = () => {
+      // Picker may have already disconnected — if so, close immediately
+      if (!this.secondaryConnections.has(connId)) {
+        appWs.close();
+        return;
+      }
+      this.log(`Secondary conn #${connId}: app-server WS connected, flushing ${entry.buffer.length} buffered messages`);
+      for (const msg of entry.buffer) {
+        try { appWs.send(msg); } catch {}
+      }
+      entry.buffer = [];
+    };
+    appWs.onmessage = (event) => {
+      if (!this.secondaryConnections.has(connId)) return;
+      const data = event.data;
+      try { ws.send(data); } catch {}
+    };
+    appWs.onerror = () => {
+      this.log(`Secondary conn #${connId}: app-server WS error`);
+    };
+    appWs.onclose = () => {
+      this.log(`Secondary conn #${connId}: app-server WS closed`);
+      const sec = this.secondaryConnections.get(connId);
+      if (sec) {
+        // App-server died — tear down the picker TUI socket too so it
+        // doesn't become a zombie that silently drops messages.
+        this.secondaryConnections.delete(connId);
+        try { sec.tuiWs.close(); } catch {}
+      }
+    };
+  }
+
+  /**
+   * Replay buffered server requests that belong to the given thread.
+   *
+   * Entries are replayed when their threadId matches `resumedThreadId`, or
+   * when they have no threadId (fallback: cannot attribute, so assume they
+   * belong to whatever the TUI is resuming). Non-matching entries stay in
+   * the buffer — they may match a subsequent resume.
+   */
+  private replayPendingForThread(resumedThreadId: string, ws: ServerWebSocket<TuiSocketData>) {
+    const remaining: BufferedServerRequest[] = [];
+    for (const buffered of this.pendingServerRequests) {
+      const belongsToThread = buffered.threadId === null || buffered.threadId === resumedThreadId;
+      if (!belongsToThread) {
+        remaining.push(buffered);
+        continue;
+      }
+      const proxyId = this.nextProxyId++;
+      try {
+        const parsed = JSON.parse(buffered.raw);
+        parsed.id = proxyId;
+        ws.send(JSON.stringify(parsed));
+        this.serverRequestToProxy.set(proxyId, {
+          raw: buffered.raw,
+          serverId: buffered.serverId,
+          connId: this.tuiConnId,
+          method: buffered.method,
+          timestamp: Date.now(),
+          threadId: buffered.threadId,
+        });
+        if (buffered.threadId === null) {
+          this.log(`WARNING: Replaying pending server request with unknown threadId (experimental fallback, may surface orphan UI on wrong thread): ${buffered.method} (server id=${buffered.serverId} → proxy id=${proxyId})`);
+        } else {
+          this.log(`Replayed buffered server request on thread/resume: ${buffered.method} (server id=${buffered.serverId} → proxy id=${proxyId}, threadId=${buffered.threadId})`);
+        }
+      } catch (e: any) {
+        this.log(`Failed to replay buffered server request: ${buffered.method} (server id=${buffered.serverId}): ${e.message}`);
+        remaining.push(buffered);
+      }
+    }
+    this.pendingServerRequests = remaining;
+  }
+
+  /**
+   * Drop buffered server requests that cannot be delivered because the TUI
+   * has started a brand-new thread (thread/start), or has resumed a thread
+   * that does not match the entry's threadId. The original listener in the
+   * app-server is already dead for these entries, so keeping them would
+   * just produce orphan approval UI on subsequent reconnects.
+   */
+  private dropOrphanPendingRequests(reason: string, matchThreadId: string | null = null) {
+    if (this.pendingServerRequests.length === 0) return;
+    const remaining: BufferedServerRequest[] = [];
+    for (const buffered of this.pendingServerRequests) {
+      const shouldDrop = matchThreadId === null
+        ? true
+        : buffered.threadId !== null && buffered.threadId !== matchThreadId;
+      if (shouldDrop) {
+        this.log(`Dropped orphan pending server request: ${buffered.method} (server id=${buffered.serverId}, threadId=${buffered.threadId ?? "unknown"}, reason=${reason})`);
+        continue;
+      }
+      remaining.push(buffered);
+    }
+    this.pendingServerRequests = remaining;
+  }
+
+  private onTuiDisconnect(ws: ServerWebSocket<TuiSocketData>) {
+    const connId = ws.data.connId;
+
+    // Check if this is a secondary (picker) connection
+    const secondary = this.secondaryConnections.get(connId);
+    if (secondary) {
+      this.log(`Secondary TUI disconnected (conn #${connId})`);
+      this.secondaryConnections.delete(connId);
+      if (secondary.appServerWs) {
+        try { secondary.appServerWs.close(); } catch {}
+      }
+      return;
+    }
+
+    // Only clear tuiWs if this is still the current connection
+    if (this.tuiWs === ws) {
+      // Capture app-server state at the moment TUI disconnects — critical
+      // for diagnosing "silent exit": did the TUI drop before or after we
+      // lost app-server? This timestamp lines up with codex-wrapper.log's
+      // exit line so we can reconstruct the sequence.
+      const appServerOpen = this.appServerWs?.readyState === WebSocket.OPEN;
+      this.log(
+        `TUI disconnected (conn #${connId}, appServerOpen=${appServerOpen}, turnInProgress=${this.turnInProgress}, pendingTuiMessages=${this.pendingTuiMessages.length}, outageQueue=${this.outageQueue.length}, reconnectingForNewSession=${this.reconnectingForNewSession})`,
+      );
+      this.tuiWs = null;
+      // Clear any pending reconnection state
+      if (this.reconnectingForNewSession) {
+        this.log("Clearing pending TUI message buffer (TUI disconnected during app-server reconnect)");
+        this.pendingTuiMessages = [];
+        this.reconnectingForNewSession = false;
+      }
+      // Clear outage buffer and timer — no TUI to replay to, and stale
+      // messages would be wrong for whatever TUI reconnects next.
+      if (this.outageQueue.length > 0 || this.outageTimer !== null) {
+        this.log(
+          `Clearing outage queue on TUI disconnect (buffered=${this.outageQueue.length})`,
+        );
+        this.outageQueue = [];
+        this.clearOutageTimer();
+      }
+      this.emit("tuiDisconnected", connId);
+    } else {
+      this.log(`Stale TUI disconnected (conn #${connId}, current is #${this.tuiConnId})`);
+    }
+    this.retireConnectionState(connId);
+  }
+
+  private onTuiMessage(ws: ServerWebSocket<TuiSocketData>, msg: string | Buffer) {
+    const data = typeof msg === "string" ? msg : msg.toString();
+    const connId = ws.data.connId;
+
+    // Route secondary (picker) connection messages to their own app-server WS
+    const secondary = this.secondaryConnections.get(connId);
+    if (secondary) {
+      if (secondary.appServerWs && secondary.appServerWs.readyState === WebSocket.OPEN) {
+        try { secondary.appServerWs.send(data); } catch {}
+      } else {
+        secondary.buffer.push(data);
+      }
+      return;
+    }
+
+    // Ignore messages from stale connections
+    if (connId !== this.tuiConnId) {
+      this.log(`Dropping message from stale TUI conn #${connId} (current is #${this.tuiConnId})`);
+      return;
+    }
+
+    // Check if this is a response to a server-originated request
+    try {
+      const parsed = JSON.parse(data);
+      if (parsed.id !== undefined && !parsed.method) {
+        const normalizedId = this.normalizeNumericId(parsed.id);
+        if (!isNaN(normalizedId) && this.pendingServerResponses.has(normalizedId)) {
+          this.log(`Ignoring duplicate approval response while app-server reconnect is pending (proxy id=${normalizedId})`);
+          return;
+        }
+        const pending = !isNaN(normalizedId) ? this.serverRequestToProxy.get(normalizedId) : undefined;
+        if (pending !== undefined) {
+          if (pending.connId !== connId) {
+            this.log(`Dropping stale server request response (proxy id=${normalizedId}, expected conn #${pending.connId}, got #${connId})`);
+            return;
+          }
+          parsed.id = pending.serverId;
+          const forwardedResponse = JSON.stringify(parsed);
+          if (!this.appServerWs || this.appServerWs.readyState !== WebSocket.OPEN) {
+            this.bufferPendingServerResponse(normalizedId, pending, forwardedResponse, "app-server disconnected");
+            return;
+          }
+          try {
+            this.appServerWs.send(forwardedResponse);
+            this.serverRequestToProxy.delete(normalizedId);
+            this.log(`TUI → app-server: ${pending.method} response (proxy id=${normalizedId} → server id=${pending.serverId})`);
+          } catch (e: any) {
+            this.bufferPendingServerResponse(normalizedId, pending, forwardedResponse, `send failed: ${e.message}`);
+          }
+          return;
+        }
+      }
+    } catch {}
+
+    // Detect method before id-rewriting so we can intercept `initialize`
+    // and buffer the RAW (un-rewritten) message for replay after reconnect.
+    let detectedMethod: string | undefined;
+    try {
+      const parsed = JSON.parse(data);
+      detectedMethod = typeof parsed.method === "string" ? parsed.method : undefined;
+    } catch {}
+
+    // When TUI sends `initialize`, reconnect app-server to give it a fresh
+    // connection-scoped session (the upstream protocol requires per-connection init).
+    // Buffer the raw message — id-rewriting happens after reconnect during replay.
+    // Skip this check during replay to avoid infinite recursion.
+    if (!this.replayingBufferedMessages) {
+      if (detectedMethod === "initialize") {
+        // Cache the raw payload for use by unintentional-reconnect replay.
+        // Replays use the TUI's original id as-is — safe because the new
+        // app-server session has no prior mapping for it.
+        this.lastInitializeRaw = data;
+        this.log("Detected initialize — reconnecting app-server for fresh session");
+        this.reconnectingForNewSession = true;
+        this.pendingTuiMessages = [data];
+        this.reconnectAppServerForNewSession(ws);
+        return;
+      }
+
+      // Buffer raw messages while reconnecting app-server for a fresh session
+      if (this.reconnectingForNewSession) {
+        this.pendingTuiMessages.push(data);
+        return;
+      }
+    }
+
+    // Cache `initialized` notification raw payload — used by
+    // handleSessionRestoreAfterReconnect to recover session state after
+    // an unintentional upstream reconnect.
+    if (detectedMethod === "initialized") {
+      this.lastInitializedRaw = data;
+    }
+
+    // Outage-path early return: buffer RAW before any id-rewriting or
+    // upstreamToClient/serverRequestToProxy mutation. This avoids a
+    // response-tracking race where `handleAppServerClose` clears mappings
+    // that our buffered `forwarded` bytes would then point to. On drain
+    // we re-enter this method with the raw bytes and do a fresh rewrite
+    // against the new app-server session.
+    //
+    // We also treat `sessionRestoreInProgress` as an outage — while we're
+    // replaying cached initialize / thread/resume, we must not let TUI
+    // requests leak onto the still-uninitialized session.
+    if (
+      !this.appServerWs
+      || this.appServerWs.readyState !== WebSocket.OPEN
+      || this.sessionRestoreInProgress
+    ) {
+      if (this.tuiWs && this.tuiWs === ws) {
+        this.bufferDuringOutage(ws, data);
+      } else {
+        this.log(
+          `WARNING: non-primary TUI attempted to send while app-server down — dropped (connId=${connId})`,
+        );
+      }
+      return;
+    }
+
+    let forwarded = data;
+    try {
+      const parsed = JSON.parse(data);
+      const method = parsed.method ?? `response:${parsed.id}`;
+      this.log(`TUI → app-server: ${method}`);
+
+      // Rewrite request id to globally unique proxy id
+      if (parsed.id !== undefined && parsed.method) {
+        const proxyId = this.nextProxyId++;
+        this.upstreamToClient.set(proxyId, { connId, clientId: parsed.id });
+        this.trackPendingRequest(parsed, connId, proxyId);
+        parsed.id = proxyId;
+        forwarded = JSON.stringify(parsed);
+      } else {
+        this.trackPendingRequest(parsed, connId);
+      }
+    } catch {
+      this.log(`TUI → app-server: (unparseable)`);
+    }
+
+    // Forward to app-server. The OPEN check above guarantees readyState was
+    // OPEN when we started processing; the narrow race where upstream closes
+    // between that check and here is handled here as a best-effort warning.
+    if (this.appServerWs?.readyState === WebSocket.OPEN) {
+      this.appServerWs.send(forwarded);
+    } else {
+      this.log(
+        `WARNING: app-server closed between OPEN check and send — message lost (connId=${ws.data.connId})`,
+      );
+    }
+  }
+
+  // ── Response Patching ──────────────────────────────────────
+
+  private handleAppServerPayload(raw: string): string | null {
+    try {
+      const parsed: unknown = JSON.parse(raw);
+      // Short-circuit: response carries an id that matches a pending
+      // session-restore replay? Consume it and suppress forwarding to
+      // the TUI (which didn't send the request and would be confused).
+      if (typeof parsed === "object" && parsed !== null && "id" in parsed) {
+        if (this.tryConsumeReplayResponse(parsed as Record<string, unknown>)) {
+          return null;
+        }
+      }
+      if (isAppServerNotification(parsed) || (typeof parsed === "object" && parsed !== null && !("id" in parsed))) {
+        const notificationLike = parsed as Record<string, unknown>;
+        // Sniff thread/closed → the ONLY signal that correlates with a
+        // silent TUI exit (code 0, empty stderr, no ERROR line). Verified
+        // via Codex's PTY reproduction: server emitting this notification
+        // causes TUI to run ExitMode::Immediate with no output. We log a
+        // high-signal line so codex-wrapper.log's `exit_0_empty_stderr`
+        // classification can be paired up by timestamp with this event.
+        if (notificationLike.method === "thread/closed") {
+          const params = notificationLike.params as Record<string, unknown> | undefined;
+          const threadId = typeof params?.threadId === "string" ? params.threadId : "unknown";
+          this.log(
+            `DIAGNOSTIC: app-server emitted thread/closed (threadId=${threadId}) — TUI will exit(0) silently`,
+          );
+        }
+        const forwarded = this.patchResponse(notificationLike, raw);
+        this.interceptServerMessage(notificationLike);
+        return forwarded;
+      }
+
+      if (isAppServerRequestMessage(parsed)) {
+        // Intentionally uses the broad isAppServerRequestMessage (any id+method) instead of
+        // the narrow isAppServerServerRequest (only known approval methods). This ensures
+        // unknown future server-to-client requests are forwarded rather than silently dropped
+        // (lesson from issue #37).
+        this.handleServerRequest(parsed, raw);
+        return null;
+      }
+
+      if (isAppServerResponseMessage(parsed)) {
+        return this.handleAppServerResponse(parsed, raw);
+      }
+
+      // Drop unclassifiable messages (not notification, not request, not response).
+      this.log(`Dropping unclassifiable app-server message: ${raw.slice(0, 100)}`);
+      return null;
+    } catch {
+      return raw;
+    }
+  }
+
+  private handleServerRequest(parsed: AppServerRequest, raw: string): void {
+    const serverId = parsed.id;
+    const method = parsed.method;
+    const threadId = this.extractThreadIdFromParams(parsed.params);
+
+    if (!this.tuiWs) {
+      this.pendingServerRequests.push({ raw, serverId, method, threadId });
+      this.log(`Server request buffered (no TUI): ${method} (server id=${serverId}, threadId=${threadId ?? "unknown"})`);
+      return;
+    }
+
+    const proxyId = this.nextProxyId++;
+    parsed.id = proxyId;
+
+    try {
+      this.tuiWs.send(JSON.stringify(parsed));
+    } catch (e: any) {
+      this.log(`Server request send failed, buffering: ${method} (server id=${serverId}): ${e.message}`);
+      this.pendingServerRequests.push({ raw, serverId, method, threadId });
+      return;
+    }
+
+    this.serverRequestToProxy.set(proxyId, {
+      raw,
+      serverId,
+      connId: this.tuiConnId,
+      method,
+      timestamp: Date.now(),
+      threadId,
+    });
+    this.log(`Server request: ${method} (server id=${serverId} → proxy id=${proxyId}, conn #${this.tuiConnId}, threadId=${threadId ?? "unknown"})`);
+  }
+
+  private extractThreadIdFromParams(params: unknown): string | null {
+    if (typeof params !== "object" || params === null) return null;
+    const tid = (params as Record<string, unknown>).threadId;
+    return typeof tid === "string" && tid.length > 0 ? tid : null;
+  }
+
+  /** Normalize a JSON-RPC id to a number. Returns NaN for non-numeric strings. */
+  private normalizeNumericId(id: unknown): number {
+    if (typeof id === "number") return id;
+    if (typeof id === "string" && /^-?\d+$/.test(id)) return Number(id);
+    return NaN;
+  }
+
+  private bufferPendingServerResponse(
+    proxyId: number,
+    pending: PendingServerRequest,
+    forwardedResponse: string,
+    reason: string,
+  ) {
+    this.pendingServerResponses.set(proxyId, {
+      raw: forwardedResponse,
+      serverId: pending.serverId,
+      method: pending.method,
+      timestamp: Date.now(),
+    });
+    this.serverRequestToProxy.delete(proxyId);
+    this.log(`Buffered approval response until app-server reconnect (${reason}) (proxy id=${proxyId} → server id=${pending.serverId})`);
+  }
+
+  private flushPendingServerResponses() {
+    if (!this.appServerWs || this.appServerWs.readyState !== WebSocket.OPEN) return;
+
+    for (const [proxyId, pending] of this.pendingServerResponses.entries()) {
+      try {
+        this.appServerWs.send(pending.raw);
+        this.pendingServerResponses.delete(proxyId);
+        this.log(`Flushed buffered approval response after app-server reconnect (proxy id=${proxyId} → server id=${pending.serverId})`);
+      } catch (e: any) {
+        this.log(`Failed to flush buffered approval response (proxy id=${proxyId}): ${e.message}`);
+        break;
+      }
+    }
+  }
+
+  private handleAppServerResponse(parsed: AppServerResponse, raw: string): string | null {
+    const responseId = parsed.id;
+    const numericId = this.normalizeNumericId(responseId);
+    const mapping = !isNaN(numericId) ? this.upstreamToClient.get(numericId) : undefined;
+
+    if (mapping) {
+      this.upstreamToClient.delete(numericId);
+
+      if (mapping.connId !== this.tuiConnId) {
+        this.log(`Dropping stale response (upstream id ${responseId}, from conn #${mapping.connId}, current #${this.tuiConnId})`);
+        return null;
+      }
+
+      parsed.id = mapping.clientId;
+      this.log(`app-server → TUI: response (proxy id=${numericId} → client id=${String(mapping.clientId)}, conn #${mapping.connId})`);
+      const forwarded = this.patchResponse(parsed, JSON.stringify(parsed));
+      this.interceptServerMessage(parsed, mapping.connId);
+      return forwarded;
+    }
+
+    if (!isNaN(numericId) && this.consumeBridgeRequestId(numericId)) {
+      if (parsed.error) {
+        this.log(`Bridge-originated request failed (id ${responseId}): ${parsed.error.message ?? "unknown error"}`);
+      } else {
+        this.log(`Bridge-originated request completed (id ${responseId})`);
+      }
+      return null;
+    }
+
+    if (!isNaN(numericId) && this.consumeStaleProxyId(numericId)) {
+      this.log(`Dropping stale response for retired upstream id ${responseId}`);
+      return null;
+    }
+
+    this.log(`Dropping unmatched app-server response id ${String(responseId)}`);
+    return null;
+  }
+
+  private patchResponse(parsed: AppServerNotification | AppServerResponse | Record<string, unknown>, raw: string): string {
+    if (isAppServerResponseMessage(parsed) && parsed.error && parsed.id !== undefined) {
+      const errMsg: string = parsed.error.message ?? "";
+      if (errMsg.includes("rate limits") || errMsg.includes("rateLimits")) {
+        this.log(`Patching rateLimits error → mock success (id: ${parsed.id})`);
+        return JSON.stringify({
+          id: parsed.id,
+          result: {
+            rateLimits: {
+              limitId: null,
+              limitName: null,
+              primary: { usedPercent: 0, windowDurationMins: 60, resetsAt: null },
+              secondary: null,
+              credits: null,
+              planType: null,
+            },
+            rateLimitsByLimitId: null,
+          },
+        });
+      }
+      // "Already initialized" is no longer patched — we reconnect the app-server
+      // WS on each TUI `initialize` request, giving it a fresh connection scope.
+    }
+    return raw;
+  }
+
+  // ── Server Message Interception (for Bridge) ───────────────
+
+  private interceptServerMessage(msg: AppServerNotification | AppServerResponse | Record<string, unknown>, connId?: number) {
+    this.handleTrackedResponse(msg, connId);
+    if ("method" in msg && typeof msg.method === "string" && isAppServerNotification(msg)) {
+      this.handleServerNotification(msg);
+    }
+  }
+
+  private handleServerNotification(msg: AppServerNotification) {
+    const { method, params } = msg;
+    switch (method) {
+      case "turn/started":
+        this.markTurnStarted(params?.turn?.id);
+        break;
+      case "item/started": {
+        const item: AppServerItem | undefined = params?.item;
+        if (item?.type === "agentMessage") this.agentMessageBuffers.set(item.id, []);
+        break;
+      }
+      case "item/agentMessage/delta": {
+        const itemId = params?.itemId;
+        if (typeof itemId !== "string") break;
+        const buf = this.agentMessageBuffers.get(itemId);
+        if (buf && params?.delta) buf.push(params.delta);
+        break;
+      }
+      case "item/completed": {
+        const item: AppServerItem | undefined = params?.item;
+        if (item?.type === "agentMessage") {
+          const content = this.extractContent(item);
+          this.agentMessageBuffers.delete(item.id);
+          if (content) {
+            this.log(`Agent message completed (${content.length} chars)`);
+            this.emit("agentMessage", {
+              id: item.id, source: "codex" as const, content, timestamp: Date.now(),
+            } satisfies BridgeMessage);
+          }
+        }
+        break;
+      }
+      case "turn/completed": {
+        const wasInProgress = this.turnInProgress;
+        this.markTurnCompleted(params?.turn?.id);
+        // Only emit when all turns are done (symmetric with turnStarted)
+        if (wasInProgress && !this.turnInProgress) {
+          this.emit("turnCompleted");
+        }
+        break;
+      }
+    }
+  }
+
+  private extractContent(item: AppServerItem): string {
+    if (item.content?.length) {
+      return item.content.filter((c) => c.type === "text" && c.text).map((c) => c.text!).join("");
+    }
+    return this.agentMessageBuffers.get(item.id)?.join("") ?? "";
+  }
+
+  /** Build a generation-scoped key: "connId:rpcId" to prevent cross-reconnect collisions. */
+  private pendingKey(rpcId: unknown, connId?: number): string | null {
+    const base = this.requestKey(rpcId);
+    if (!base) return null;
+    return `${connId ?? this.tuiConnId}:${base}`;
+  }
+
+  private trackPendingRequest(message: AppServerRequest | Record<string, unknown>, connId: number, _proxyId?: number) {
+    const rpcId = "id" in message ? message.id : undefined;
+    const method = "method" in message && typeof message.method === "string" ? message.method : undefined;
+    const key = this.pendingKey(rpcId, connId);
+
+    if (!key || !isTrackedAppServerRequestMethod(method)) return;
+
+    const pending: PendingRequest = { method };
+    if (method === "turn/start") {
+      const params = "params" in message && typeof message.params === "object" && message.params !== null
+        ? message.params as Record<string, unknown>
+        : undefined;
+      const threadId = params?.threadId;
+      if (typeof threadId === "string" && threadId.length > 0) {
+        pending.threadId = threadId;
+      }
+    }
+
+    if (this.pendingRequests.has(key)) {
+      this.log(`WARNING: overwriting pending request for key ${key}`);
+    }
+
+    this.pendingRequests.set(key, pending);
+  }
+
+  // TODO: narrow this type further once response shapes are fully typed (#47 follow-up)
+  private handleTrackedResponse(message: any, connId?: number) {
+    const key = this.pendingKey(message?.id, connId);
+    if (!key) return;
+
+    const pending = this.pendingRequests.get(key);
+    if (!pending) {
+      // Log responses that have result.thread.id for debugging
+      if (message?.result?.thread?.id) {
+        this.log(`[track-resp] Unmatched response with thread.id=${message.result.thread.id}, key=${key}, pending keys=[${[...this.pendingRequests.keys()].join(",")}]`);
+      }
+      return;
+    }
+
+    this.pendingRequests.delete(key);
+
+    if (message?.error) {
+      this.log(
+        `Tracked request failed (${pending.method}, id ${key}): ${message.error.message ?? "unknown error"}`,
+      );
+      return;
+    }
+
+    switch (pending.method) {
+      case "thread/start": {
+        const threadId = message?.result?.thread?.id;
+        if (typeof threadId === "string" && threadId.length > 0) {
+          this.setActiveThreadId(threadId, `thread/start response ${key}`);
+        }
+        // User started a brand-new session — any buffered server requests
+        // belong to a thread the user has abandoned. Drop them so they do
+        // not surface as orphan approval UI.
+        this.dropOrphanPendingRequests(`thread/start (new session)`);
+        break;
+      }
+      case "thread/resume": {
+        const threadId = message?.result?.thread?.id;
+        if (typeof threadId === "string" && threadId.length > 0) {
+          this.setActiveThreadId(threadId, `thread/resume response ${key}`);
+          if (this.tuiWs) {
+            this.replayPendingForThread(threadId, this.tuiWs);
+          }
+          // Drop any entries that belong to a different thread than the
+          // resumed one — the user did not return to them.
+          this.dropOrphanPendingRequests(`thread/resume to ${threadId}`, threadId);
+        }
+        break;
+      }
+      case "turn/start":
+        if (pending.threadId) {
+          this.setActiveThreadId(pending.threadId, `turn/start response ${key}`);
+        }
+        break;
+    }
+  }
+
+  private setActiveThreadId(threadId: string, reason: string) {
+    if (this.threadId === threadId) return;
+
+    const previousThreadId = this.threadId;
+    this.threadId = threadId;
+
+    if (previousThreadId) {
+      this.log(`Active thread changed: ${previousThreadId} → ${threadId} (${reason})`);
+      return;
+    }
+
+    this.log(`Thread detected: ${threadId} (${reason})`);
+    this.emit("ready", threadId);
+  }
+
+  private markTurnStarted(turnId?: string) {
+    const wasInProgress = this.turnInProgress;
+    if (typeof turnId === "string" && turnId.length > 0) {
+      this.activeTurnIds.add(turnId);
+    } else {
+      this.activeTurnIds.add(`unknown:${Date.now()}`);
+    }
+
+    this.turnInProgress = this.activeTurnIds.size > 0;
+    if (!wasInProgress && this.turnInProgress) {
+      this.emit("turnStarted");
+    }
+  }
+
+  private markTurnCompleted(turnId?: string) {
+    if (typeof turnId === "string" && turnId.length > 0) {
+      this.activeTurnIds.delete(turnId);
+    } else {
+      this.activeTurnIds.clear();
+    }
+
+    this.turnInProgress = this.activeTurnIds.size > 0;
+  }
+
+  private requestKey(id: unknown): string | null {
+    if (typeof id === "number" || typeof id === "string") return String(id);
+    return null;
+  }
+
+  private retireConnectionState(connId: number) {
+    const prefix = `${connId}:`;
+    for (const key of this.pendingRequests.keys()) {
+      if (key.startsWith(prefix)) this.pendingRequests.delete(key);
+    }
+
+    for (const [upId, mapping] of this.upstreamToClient.entries()) {
+      if (mapping.connId !== connId) continue;
+      this.upstreamToClient.delete(upId);
+      this.trackStaleProxyId(upId);
+    }
+
+    const requeuedServerRequests: BufferedServerRequest[] = [];
+    for (const [proxyId, pending] of this.serverRequestToProxy.entries()) {
+      if (pending.connId === connId) {
+        this.serverRequestToProxy.delete(proxyId);
+        requeuedServerRequests.push({
+          raw: pending.raw,
+          serverId: pending.serverId,
+          method: pending.method,
+          threadId: pending.threadId,
+        });
+        this.log(`Requeued in-flight server request after TUI disconnect (proxy id=${proxyId}, server id=${pending.serverId}, method=${pending.method}, threadId=${pending.threadId ?? "unknown"})`);
+      }
+    }
+
+    if (requeuedServerRequests.length === 0) return;
+
+    this.pendingServerRequests.push(...requeuedServerRequests);
+
+    // Do not replay immediately even if a new primary is already connected.
+    // Replay is deferred until the new TUI completes thread/resume to a
+    // matching thread — see handleTrackedResponse.
+  }
+
+  private trackStaleProxyId(proxyId: number) {
+    this.clearTrackedId(this.staleProxyIds, proxyId);
+
+    const timer = setTimeout(() => {
+      this.staleProxyIds.delete(proxyId);
+    }, CodexAdapter.RESPONSE_TRACKING_TTL_MS);
+    timer.unref?.();
+    this.staleProxyIds.set(proxyId, timer);
+  }
+
+  private consumeStaleProxyId(proxyId: number) {
+    return this.clearTrackedId(this.staleProxyIds, proxyId);
+  }
+
+  private trackBridgeRequestId(requestId: number) {
+    this.clearTrackedId(this.bridgeRequestIds, requestId);
+
+    const timer = setTimeout(() => {
+      this.bridgeRequestIds.delete(requestId);
+    }, CodexAdapter.RESPONSE_TRACKING_TTL_MS);
+    timer.unref?.();
+    this.bridgeRequestIds.set(requestId, timer);
+  }
+
+  private consumeBridgeRequestId(requestId: number) {
+    return this.clearTrackedId(this.bridgeRequestIds, requestId);
+  }
+
+  private untrackBridgeRequestId(requestId: number) {
+    this.clearTrackedId(this.bridgeRequestIds, requestId);
+  }
+
+  private clearTrackedId(store: Map<number, ReturnType<typeof setTimeout>>, id: number) {
+    const timer = store.get(id);
+    if (!timer) return false;
+    clearTimeout(timer);
+    store.delete(id);
+    return true;
+  }
+
+  private clearTransientResponseTrackingState() {
+    this.pendingRequests.clear();
+    this.upstreamToClient.clear();
+
+    for (const timer of this.staleProxyIds.values()) {
+      clearTimeout(timer);
+    }
+    this.staleProxyIds.clear();
+
+    for (const timer of this.bridgeRequestIds.values()) {
+      clearTimeout(timer);
+    }
+    this.bridgeRequestIds.clear();
+  }
+
+  private clearResponseTrackingState() {
+    this.clearTransientResponseTrackingState();
+    this.serverRequestToProxy.clear();
+    this.pendingServerRequests = [];
+    this.pendingServerResponses.clear();
+  }
+
+  /**
+   * Variant used by the intentional app-server reconnect triggered by a TUI
+   * `initialize` message. Preserves `pendingServerRequests` so they can be
+   * replayed after the TUI completes `thread/resume`. In-flight server
+   * requests are moved into the pending buffer so they get the same
+   * replay-on-resume treatment. The serverIds are stale with respect to
+   * the new app-server session — the subsequent response will most likely
+   * be rejected upstream, which is precisely what the A' experiment tests.
+   */
+  private clearResponseTrackingStateForAppServerReconnect() {
+    this.clearTransientResponseTrackingState();
+    for (const pending of this.serverRequestToProxy.values()) {
+      this.pendingServerRequests.push({
+        raw: pending.raw,
+        serverId: pending.serverId,
+        method: pending.method,
+        threadId: pending.threadId,
+      });
+      this.log(`Requeued in-flight server request on app-server reconnect (server id=${pending.serverId}, method=${pending.method}, threadId=${pending.threadId ?? "unknown"})`);
+    }
+    this.serverRequestToProxy.clear();
+    // Intentionally preserve pendingServerRequests across the reconnect.
+    this.pendingServerResponses.clear();
+  }
+
+  /**
+   * Build the lsof command used to find LISTENing processes on a TCP port.
+   *
+   * Restricting to `-sTCP:LISTEN` is critical: a bare `lsof -ti :PORT` also
+   * returns processes that merely have an outbound (client) FD to that port,
+   * including stale CLOSED connections from crashed clients. Those false
+   * positives caused `abg claude` to refuse startup whenever a previous
+   * Codex TUI process lingered with a half-closed connection to port 4501.
+   */
+  static buildPortListenLsofCommand(port: number): string {
+    return `lsof -ti tcp:${port} -sTCP:LISTEN`;
+  }
+
+  /**
+   * Clean up stale ports before starting.
+   * Only kills `codex app-server` processes (our own stale proxy-side spawns). If the port is
+   * occupied by something else, throws with a clear message.
+   */
+  private async checkPorts() {
+    for (const port of [this.proxyPort]) {
+      try {
+        const pids = execSync(CodexAdapter.buildPortListenLsofCommand(port), {
+          encoding: "utf-8",
+        }).trim();
+        if (!pids) continue;
+
+        // Check if the occupying process is a codex app-server (our own stale spawn)
+        const pidList = pids.split("\n").map((p) => p.trim()).filter(Boolean);
+        const staleCodexPids: string[] = [];
+        const foreignPids: string[] = [];
+
+        for (const pid of pidList) {
+          try {
+            const cmdline = execSync(`ps -p ${pid} -o args=`, { encoding: "utf-8" }).trim();
+            if (cmdline.includes("codex") && cmdline.includes("app-server")) {
+              staleCodexPids.push(pid);
+            } else {
+              foreignPids.push(pid);
+            }
+          } catch {
+            // Process already gone
+          }
+        }
+
+        // Kill stale codex app-server processes (our own previous spawns)
+        if (staleCodexPids.length > 0) {
+          this.log(`Cleaning up stale codex app-server on port ${port}: PID(s) ${staleCodexPids.join(", ")}`);
+          for (const pid of staleCodexPids) {
+            try { execSync(`kill ${pid}`, { encoding: "utf-8" }); } catch {}
+          }
+          await new Promise((r) => setTimeout(r, 500));
+        }
+
+        // If foreign processes still occupy the port, fail with a clear message
+        if (foreignPids.length > 0) {
+          throw new Error(
+            `Port ${port} is already in use by non-Codex process(es): PID(s) ${foreignPids.join(", ")}. ` +
+            `Please stop the process or set a different port via CODEX_PROXY_PORT env var.`
+          );
+        }
+
+        // Verify port is now free
+        try {
+          const remaining = execSync(CodexAdapter.buildPortListenLsofCommand(port), {
+            encoding: "utf-8",
+          }).trim();
+          if (remaining) {
+            throw new Error(
+              `Port ${port} is still occupied (PID(s): ${remaining.replace(/\n/g, ", ")}) after cleanup. ` +
+              `Please stop the process or set a different port via CODEX_PROXY_PORT env var.`
+            );
+          }
+        } catch (err: any) {
+          if (err.message?.includes("Port")) throw err;
+          // lsof exit 1 = port free, good
+        }
+      } catch (err: any) {
+        // lsof returns exit code 1 if no match — port is free
+        if (err.message?.includes("Port") || err.message?.includes("non-Codex")) throw err;
+      }
+    }
+  }
+
+  private log(msg: string) {
+    const line = `[${new Date().toISOString()}] [CodexAdapter] ${msg}\n`;
+    process.stderr.write(line);
+    try { appendFileSync(this.logFile, line); } catch {}
+  }
+}

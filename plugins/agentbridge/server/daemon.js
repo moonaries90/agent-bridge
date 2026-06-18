@@ -1,0 +1,3460 @@
+#!/usr/bin/env bun
+// @bun
+
+// src/daemon.ts
+import { appendFileSync as appendFileSync4 } from "fs";
+
+// src/codex-adapter.ts
+import { spawn, execSync } from "child_process";
+import { createInterface } from "readline";
+import { EventEmitter } from "events";
+import { appendFileSync } from "fs";
+
+// src/state-dir.ts
+import { mkdirSync, existsSync } from "fs";
+import { join } from "path";
+import { homedir, platform } from "os";
+
+class StateDirResolver {
+  stateDir;
+  constructor(envOverride) {
+    const override = envOverride ?? process.env.AGENTBRIDGE_STATE_DIR;
+    if (override) {
+      this.stateDir = override;
+    } else if (platform() === "darwin") {
+      this.stateDir = join(homedir(), "Library", "Application Support", "AgentBridge");
+    } else {
+      const xdgState = process.env.XDG_STATE_HOME ?? join(homedir(), ".local", "state");
+      this.stateDir = join(xdgState, "agentbridge");
+    }
+  }
+  ensure() {
+    if (!existsSync(this.stateDir)) {
+      mkdirSync(this.stateDir, { recursive: true });
+    }
+  }
+  get dir() {
+    return this.stateDir;
+  }
+  get pidFile() {
+    return join(this.stateDir, "daemon.pid");
+  }
+  get tuiPidFile() {
+    return join(this.stateDir, "codex-tui.pid");
+  }
+  get lockFile() {
+    return join(this.stateDir, "daemon.lock");
+  }
+  get statusFile() {
+    return join(this.stateDir, "status.json");
+  }
+  get portsFile() {
+    return join(this.stateDir, "ports.json");
+  }
+  get logFile() {
+    return join(this.stateDir, "agentbridge.log");
+  }
+  get codexWrapperLogFile() {
+    return join(this.stateDir, "codex-wrapper.log");
+  }
+  get killedFile() {
+    return join(this.stateDir, "killed");
+  }
+}
+
+// src/app-server-protocol.ts
+var APP_SERVER_TRACKED_REQUEST_METHODS = [
+  "thread/start",
+  "thread/resume",
+  "turn/start"
+];
+var APP_SERVER_SERVER_REQUEST_METHODS = [
+  "item/permissions/requestApproval",
+  "item/fileChange/requestApproval",
+  "item/commandExecution/requestApproval"
+];
+var APP_SERVER_NOTIFICATION_METHODS = [
+  "turn/started",
+  "turn/completed",
+  "item/started",
+  "item/agentMessage/delta",
+  "item/completed"
+];
+var TRACKED_REQUEST_METHOD_SET = new Set(APP_SERVER_TRACKED_REQUEST_METHODS);
+var SERVER_REQUEST_METHOD_SET = new Set(APP_SERVER_SERVER_REQUEST_METHODS);
+var NOTIFICATION_METHOD_SET = new Set(APP_SERVER_NOTIFICATION_METHODS);
+function isObjectRecord(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function isTrackedAppServerRequestMethod(method) {
+  return typeof method === "string" && TRACKED_REQUEST_METHOD_SET.has(method);
+}
+function isAppServerRequestMessage(value) {
+  if (!isObjectRecord(value))
+    return false;
+  return (typeof value.id === "number" || typeof value.id === "string") && typeof value.method === "string";
+}
+function isAppServerNotification(value) {
+  if (!isObjectRecord(value))
+    return false;
+  return value.id === undefined && typeof value.method === "string" && NOTIFICATION_METHOD_SET.has(value.method);
+}
+function isAppServerResponseMessage(value) {
+  if (!isObjectRecord(value))
+    return false;
+  return (typeof value.id === "number" || typeof value.id === "string") && value.method === undefined && (("result" in value) || ("error" in value));
+}
+
+// src/codex-adapter.ts
+class StdioAppServerConnection {
+  log;
+  readyState = WebSocket.CONNECTING;
+  onopen = null;
+  onmessage = null;
+  onerror = null;
+  onclose = null;
+  child;
+  closed = false;
+  constructor(log, extraArgs = [], workDir) {
+    this.log = log;
+    this.child = spawn("codex", ["app-server", "--listen", "stdio://", ...extraArgs], {
+      stdio: ["pipe", "pipe", "pipe"],
+      cwd: workDir
+    });
+    this.child.on("error", (err) => {
+      this.log(`[codex-server] failed to start: ${err.message}`);
+      this.onerror?.(err);
+      this.finishClose(null, err.message);
+    });
+    this.child.on("exit", (code, signal) => {
+      this.finishClose(code, signal ? `signal ${signal}` : `exit ${code ?? "unknown"}`);
+    });
+    if (this.child.stdout) {
+      const stdoutRl = createInterface({ input: this.child.stdout });
+      stdoutRl.on("line", (line) => {
+        this.onmessage?.({ data: line });
+      });
+    }
+    if (this.child.stderr) {
+      const stderrRl = createInterface({ input: this.child.stderr });
+      stderrRl.on("line", (line) => this.log(`[codex-server] ${line}`));
+    }
+    queueMicrotask(() => {
+      if (this.readyState !== WebSocket.CONNECTING)
+        return;
+      this.readyState = WebSocket.OPEN;
+      this.onopen?.();
+    });
+  }
+  send(data) {
+    if (this.readyState !== WebSocket.OPEN || !this.child.stdin?.writable) {
+      throw new Error("Codex app-server stdio is not open");
+    }
+    this.child.stdin.write(data.endsWith(`
+`) ? data : `${data}
+`);
+  }
+  close() {
+    if (this.closed || this.readyState === WebSocket.CLOSED)
+      return;
+    this.readyState = WebSocket.CLOSING;
+    try {
+      this.child.stdin?.end();
+    } catch {}
+    try {
+      this.child.kill("SIGTERM");
+    } catch {}
+    const killTimer = setTimeout(() => {
+      try {
+        this.child.kill("SIGKILL");
+      } catch {}
+    }, 2000);
+    this.child.once("exit", () => clearTimeout(killTimer));
+  }
+  finishClose(code, reason) {
+    if (this.closed)
+      return;
+    this.closed = true;
+    this.readyState = WebSocket.CLOSED;
+    this.onclose?.({ code, reason });
+  }
+}
+
+class CodexAdapter extends EventEmitter {
+  static RESPONSE_TRACKING_TTL_MS = 30000;
+  appServerWs = null;
+  tuiWs = null;
+  proxyServer = null;
+  stopped = false;
+  threadId = null;
+  nextInjectionId = -1;
+  appPort;
+  proxyPort;
+  logFile;
+  appServerArgs;
+  workDir;
+  tuiConnId = 0;
+  connIdCounter = 0;
+  secondaryConnections = new Map;
+  agentMessageBuffers = new Map;
+  pendingRequests = new Map;
+  activeTurnIds = new Set;
+  turnInProgress = false;
+  nextProxyId = 1e5;
+  upstreamToClient = new Map;
+  serverRequestToProxy = new Map;
+  pendingServerRequests = [];
+  pendingServerResponses = new Map;
+  staleProxyIds = new Map;
+  bridgeRequestIds = new Map;
+  intentionalDisconnect = false;
+  pendingTuiMessages = [];
+  reconnectingForNewSession = false;
+  replayingBufferedMessages = false;
+  appServerGeneration = 0;
+  outageQueue = [];
+  outageTimer = null;
+  static OUTAGE_QUEUE_MAX = 64;
+  static OUTAGE_TIMEOUT_MS = 5000;
+  lastInitializeRaw = null;
+  lastInitializedRaw = null;
+  sessionRestoreInProgress = false;
+  replayPending = new Map;
+  static SESSION_REPLAY_TIMEOUT_MS = 5000;
+  constructor(appPort = 4500, proxyPort = 4501, logFile = new StateDirResolver().logFile, appServerArgs = [], workDir) {
+    super();
+    this.appPort = appPort;
+    this.proxyPort = proxyPort;
+    this.logFile = logFile;
+    this.appServerArgs = appServerArgs;
+    this.workDir = workDir;
+  }
+  get appServerUrl() {
+    return "stdio://";
+  }
+  get proxyUrl() {
+    return `ws://127.0.0.1:${this.proxyPort}`;
+  }
+  get activeThreadId() {
+    return this.threadId;
+  }
+  async start() {
+    this.stopped = false;
+    this.intentionalDisconnect = false;
+    await this.checkPorts();
+    this.log("Spawning codex app-server over stdio");
+    await this.connectToAppServer();
+    this.startProxy();
+    this.log(`Proxy ready on ${this.proxyUrl}`);
+  }
+  disconnect() {
+    this.intentionalDisconnect = true;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    this.outageQueue = [];
+    this.clearOutageTimer();
+    this.appServerWs?.close();
+    this.appServerWs = null;
+    for (const [id, sec] of this.secondaryConnections) {
+      try {
+        sec.appServerWs?.close();
+      } catch {}
+      this.secondaryConnections.delete(id);
+    }
+    this.proxyServer?.stop();
+    this.proxyServer = null;
+    this.clearResponseTrackingState();
+  }
+  stop() {
+    this.stopped = true;
+    this.intentionalDisconnect = true;
+    this.disconnect();
+  }
+  injectMessage(text) {
+    if (!this.threadId) {
+      this.log("Cannot inject: no active thread");
+      return false;
+    }
+    if (!this.appServerWs || this.appServerWs.readyState !== WebSocket.OPEN) {
+      this.log("Cannot inject: app-server WebSocket not connected");
+      return false;
+    }
+    if (this.turnInProgress) {
+      this.log(`Rejected injection: Codex turn is in progress (thread ${this.threadId})`);
+      return false;
+    }
+    this.log(`Injecting message into Codex (${text.length} chars)`);
+    const requestId = this.nextInjectionId--;
+    this.trackBridgeRequestId(requestId);
+    try {
+      this.appServerWs.send(JSON.stringify({
+        method: "turn/start",
+        id: requestId,
+        params: { threadId: this.threadId, input: [{ type: "text", text }] }
+      }));
+      return true;
+    } catch (err) {
+      this.untrackBridgeRequestId(requestId);
+      this.log(`Injection send failed: ${err.message}`);
+      return false;
+    }
+  }
+  currentActiveTurnId() {
+    let found = null;
+    for (const id of this.activeTurnIds) {
+      if (!id.startsWith("unknown:"))
+        found = id;
+    }
+    return found;
+  }
+  async steerMessage(text) {
+    if (!this.threadId)
+      return false;
+    if (!this.appServerWs || this.appServerWs.readyState !== WebSocket.OPEN)
+      return false;
+    const expectedTurnId = this.currentActiveTurnId();
+    if (!expectedTurnId)
+      return false;
+    const requestId = this.nextInjectionId--;
+    const raw = JSON.stringify({
+      method: "turn/steer",
+      id: requestId,
+      params: { threadId: this.threadId, input: [{ type: "text", text }], expectedTurnId }
+    });
+    this.log(`Steering message into active turn ${expectedTurnId} (${text.length} chars)`);
+    try {
+      await this.sendReplayAndAwait(raw, "turn/steer");
+      return true;
+    } catch (err) {
+      this.log(`turn/steer failed (${err.message}); falling back to queued turn/start`);
+      return false;
+    }
+  }
+  connectToAppServer(isReconnect = false) {
+    const generation = ++this.appServerGeneration;
+    return new Promise((resolve, reject) => {
+      const appWs = this.createAppServerConnection();
+      let opened = false;
+      appWs.onopen = () => {
+        if (this.appServerGeneration !== generation) {
+          appWs.close();
+          return;
+        }
+        opened = true;
+        this.appServerWs = appWs;
+        this.intentionalDisconnect = false;
+        this.reconnectAttempts = 0;
+        this.log(isReconnect ? "Reconnected to app-server" : "Connected to app-server");
+        this.flushPendingServerResponses();
+        if (isReconnect) {
+          this.handleSessionRestoreAfterReconnect().finally(() => this.drainOutageQueue()).catch((e) => {
+            const m = e instanceof Error ? e.message : String(e);
+            this.log(`session restore unexpected error: ${m}`);
+          });
+        } else {
+          this.drainOutageQueue();
+        }
+        resolve();
+      };
+      appWs.onmessage = (event) => {
+        if (this.appServerGeneration !== generation)
+          return;
+        const data = event.data;
+        const forwarded = this.handleAppServerPayload(data);
+        if (forwarded === null)
+          return;
+        if (this.tuiWs) {
+          try {
+            this.tuiWs.send(forwarded);
+          } catch (e) {
+            this.log(`Failed to forward message to TUI: ${e.message}`);
+          }
+        } else {
+          this.log("WARNING: response from app-server but no TUI connected, message dropped");
+        }
+      };
+      appWs.onerror = () => {
+        if (this.appServerGeneration !== generation)
+          return;
+        this.log("App-server connection error");
+        if (!isReconnect)
+          reject(new Error("Failed to connect to app-server"));
+      };
+      appWs.onclose = (event) => {
+        if (this.appServerGeneration !== generation)
+          return;
+        if (!opened && !isReconnect) {
+          reject(new Error(`Codex app-server closed before opening: ${event.reason}`));
+          return;
+        }
+        this.handleAppServerClose();
+      };
+    });
+  }
+  createAppServerConnection() {
+    return new StdioAppServerConnection((msg) => this.log(msg), this.appServerArgs, this.workDir);
+  }
+  async reconnectAppServerForNewSession(tuiWs) {
+    this.appServerGeneration++;
+    this.intentionalDisconnect = true;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    const oldWs = this.appServerWs;
+    this.appServerWs = null;
+    if (oldWs) {
+      try {
+        oldWs.close();
+      } catch {}
+    }
+    this.clearResponseTrackingStateForAppServerReconnect();
+    this.activeTurnIds.clear();
+    this.turnInProgress = false;
+    try {
+      await this.connectToAppServer(false);
+      this.log("App-server reconnected for new TUI session \u2014 replaying buffered messages");
+      const messages = this.pendingTuiMessages;
+      this.pendingTuiMessages = [];
+      this.reconnectingForNewSession = false;
+      this.replayingBufferedMessages = true;
+      try {
+        for (const msg of messages) {
+          this.onTuiMessage(tuiWs, msg);
+        }
+      } finally {
+        this.replayingBufferedMessages = false;
+      }
+    } catch (err) {
+      this.log(`Failed to reconnect app-server for new session: ${err.message}`);
+      this.pendingTuiMessages = [];
+      this.reconnectingForNewSession = false;
+      this.intentionalDisconnect = false;
+      this.scheduleReconnect();
+    }
+  }
+  reconnectAttempts = 0;
+  reconnectTimer = null;
+  static MAX_RECONNECT_ATTEMPTS = 10;
+  static RECONNECT_BASE_DELAY_MS = 1000;
+  scheduleReconnect() {
+    if (this.stopped)
+      return;
+    if (this.reconnectAttempts >= CodexAdapter.MAX_RECONNECT_ATTEMPTS) {
+      this.log(`App-server reconnect failed after ${this.reconnectAttempts} attempts. Giving up.`);
+      this.emit("error", new Error("App-server connection lost and reconnect failed"));
+      return;
+    }
+    const delay = Math.min(CodexAdapter.RECONNECT_BASE_DELAY_MS * Math.pow(2, this.reconnectAttempts), 30000);
+    this.reconnectAttempts++;
+    this.log(`Scheduling app-server reconnect attempt ${this.reconnectAttempts}/${CodexAdapter.MAX_RECONNECT_ATTEMPTS} in ${delay}ms...`);
+    this.reconnectTimer = setTimeout(async () => {
+      try {
+        await this.connectToAppServer(true);
+        this.log("App-server reconnect successful");
+      } catch {
+        this.log("App-server reconnect attempt failed");
+        this.scheduleReconnect();
+      }
+    }, delay);
+  }
+  handleAppServerClose() {
+    const intentional = this.intentionalDisconnect;
+    const tuiConnected = this.tuiWs !== null;
+    this.log(`App-server connection closed (intentional=${intentional}, tuiConnected=${tuiConnected}, turnInProgress=${this.turnInProgress})`);
+    this.appServerWs = null;
+    this.clearResponseTrackingState();
+    this.activeTurnIds.clear();
+    this.turnInProgress = false;
+    if (!intentional) {
+      this.scheduleReconnect();
+    }
+  }
+  bufferDuringOutage(ws, raw) {
+    if (this.outageQueue.length >= CodexAdapter.OUTAGE_QUEUE_MAX) {
+      this.log(`ERROR: outage queue overflow (${this.outageQueue.length}/${CodexAdapter.OUTAGE_QUEUE_MAX}) \u2014 closing TUI with 1011`);
+      this.outageQueue = [];
+      this.clearOutageTimer();
+      if (this.tuiWs && this.tuiWs === ws) {
+        try {
+          ws.close(1011, "agentbridge: app-server unavailable; pending TUI queue overflow");
+        } catch (e) {
+          this.log(`Failed to close TUI WS after outage queue overflow: ${e.message}`);
+        }
+      }
+      return;
+    }
+    this.outageQueue.push({ raw, connId: ws.data.connId });
+    this.log(`DIAGNOSTIC: buffered TUI message while app-server unavailable (queue size=${this.outageQueue.length}/${CodexAdapter.OUTAGE_QUEUE_MAX})`);
+    this.ensureOutageTimer();
+  }
+  ensureOutageTimer() {
+    if (this.outageTimer !== null)
+      return;
+    this.outageTimer = setTimeout(() => {
+      this.outageTimer = null;
+      const buffered = this.outageQueue.length;
+      this.outageQueue = [];
+      this.log(`ERROR: app-server did not return within ${CodexAdapter.OUTAGE_TIMEOUT_MS}ms (buffered=${buffered}) \u2014 closing TUI with 1011`);
+      const ws = this.tuiWs;
+      if (ws) {
+        try {
+          ws.close(1011, `agentbridge: app-server unavailable after ${CodexAdapter.OUTAGE_TIMEOUT_MS}ms; buffered=${buffered}`);
+        } catch (e) {
+          this.log(`Failed to close TUI WS on outage timeout: ${e.message}`);
+        }
+      }
+    }, CodexAdapter.OUTAGE_TIMEOUT_MS);
+  }
+  clearOutageTimer() {
+    if (this.outageTimer !== null) {
+      clearTimeout(this.outageTimer);
+      this.outageTimer = null;
+    }
+  }
+  async handleSessionRestoreAfterReconnect() {
+    if (!this.lastInitializeRaw) {
+      this.log("DIAGNOSTIC: no cached initialize to replay after unintentional reconnect");
+      return;
+    }
+    if (!this.appServerWs || this.appServerWs.readyState !== WebSocket.OPEN) {
+      this.log("DIAGNOSTIC: app-server not open at session restore start \u2014 skipping");
+      return;
+    }
+    this.sessionRestoreInProgress = true;
+    try {
+      this.log(`DIAGNOSTIC: replaying cached initialize to restore session (threadId=${this.threadId ?? "none"})`);
+      await this.sendReplayAndAwait(this.lastInitializeRaw, "initialize");
+      if (this.lastInitializedRaw && this.appServerWs.readyState === WebSocket.OPEN) {
+        this.appServerWs.send(this.lastInitializedRaw);
+      }
+      if (this.threadId && this.appServerWs.readyState === WebSocket.OPEN) {
+        const replayId = `agentbridge-replay-thread-resume-${Date.now()}`;
+        const resumeRaw = JSON.stringify({
+          jsonrpc: "2.0",
+          id: replayId,
+          method: "thread/resume",
+          params: { threadId: this.threadId }
+        });
+        await this.sendReplayAndAwait(resumeRaw, "thread/resume");
+      }
+      this.log(`DIAGNOSTIC: session restored after unintentional reconnect (threadId=${this.threadId ?? "none"})`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.log(`ERROR: session restore failed (${msg}) \u2014 closing TUI with 1011`);
+      const tuiWs = this.tuiWs;
+      if (tuiWs) {
+        try {
+          tuiWs.close(1011, `agentbridge: session restore failed: ${msg}`);
+        } catch (closeErr) {
+          const cm = closeErr instanceof Error ? closeErr.message : String(closeErr);
+          this.log(`Failed to close TUI after session restore failure: ${cm}`);
+        }
+      }
+    } finally {
+      this.sessionRestoreInProgress = false;
+    }
+  }
+  sendReplayAndAwait(raw, method) {
+    if (!this.appServerWs || this.appServerWs.readyState !== WebSocket.OPEN) {
+      return Promise.reject(new Error("app-server not open"));
+    }
+    let id;
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed.id === undefined) {
+        return Promise.reject(new Error(`replay payload for ${method} has no id`));
+      }
+      id = parsed.id;
+    } catch (e) {
+      const m = e instanceof Error ? e.message : String(e);
+      return Promise.reject(new Error(`replay parse failed for ${method}: ${m}`));
+    }
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.replayPending.delete(id);
+        reject(new Error(`replay timeout (${CodexAdapter.SESSION_REPLAY_TIMEOUT_MS}ms) for ${method} id=${JSON.stringify(id)}`));
+      }, CodexAdapter.SESSION_REPLAY_TIMEOUT_MS);
+      this.replayPending.set(id, { method, resolve, reject, timer });
+      try {
+        this.appServerWs.send(raw);
+      } catch (e) {
+        clearTimeout(timer);
+        this.replayPending.delete(id);
+        const m = e instanceof Error ? e.message : String(e);
+        reject(new Error(`replay send failed for ${method}: ${m}`));
+      }
+    });
+  }
+  tryConsumeReplayResponse(payload) {
+    const id = payload.id;
+    if (id === undefined)
+      return false;
+    const pending = this.replayPending.get(id);
+    if (!pending)
+      return false;
+    clearTimeout(pending.timer);
+    this.replayPending.delete(id);
+    if (payload.error !== undefined) {
+      const errMsg = typeof payload.error === "object" && payload.error !== null && "message" in payload.error ? String(payload.error.message ?? "unknown") : JSON.stringify(payload.error);
+      pending.reject(new Error(`${pending.method} rejected: ${errMsg}`));
+    } else {
+      pending.resolve(payload);
+    }
+    return true;
+  }
+  drainOutageQueue() {
+    if (this.outageQueue.length === 0) {
+      this.clearOutageTimer();
+      return;
+    }
+    if (!this.appServerWs || this.appServerWs.readyState !== WebSocket.OPEN)
+      return;
+    const ws = this.tuiWs;
+    if (!ws) {
+      this.outageQueue = [];
+      this.clearOutageTimer();
+      return;
+    }
+    const messages = this.outageQueue;
+    this.outageQueue = [];
+    this.clearOutageTimer();
+    this.log(`DIAGNOSTIC: replaying ${messages.length} buffered TUI messages after app-server reconnect`);
+    for (const msg of messages) {
+      try {
+        this.onTuiMessage(ws, msg.raw);
+      } catch (e) {
+        this.log(`Failed to replay buffered TUI message (conn #${msg.connId}): ${e.message}`);
+      }
+    }
+  }
+  startProxy() {
+    const self = this;
+    this.proxyServer = Bun.serve({
+      port: this.proxyPort,
+      hostname: "127.0.0.1",
+      fetch(req, server) {
+        const url = new URL(req.url);
+        const isUpgrade = req.headers.get("upgrade")?.toLowerCase() === "websocket";
+        self.log(`HTTP ${req.method} ${url.pathname} (upgrade=${isUpgrade})`);
+        if (url.pathname === "/healthz" || url.pathname === "/readyz") {
+          return Response.json({
+            ok: self.appServerWs?.readyState === WebSocket.OPEN,
+            appServerUrl: self.appServerUrl,
+            proxyUrl: self.proxyUrl
+          });
+        }
+        if (server.upgrade(req, { data: { connId: 0 } }))
+          return;
+        self.log(`WARNING: non-upgrade HTTP request not handled: ${req.method} ${url.pathname}`);
+        return new Response("AgentBridge Codex Proxy");
+      },
+      websocket: {
+        open: (ws) => self.onTuiConnect(ws),
+        close: (ws, code, reason) => {
+          self.log(`WebSocket close event: conn #${ws.data.connId}, code=${code}, reason=${reason || "none"}`);
+          self.onTuiDisconnect(ws);
+        },
+        message: (ws, msg) => self.onTuiMessage(ws, msg)
+      }
+    });
+  }
+  onTuiConnect(ws) {
+    const connId = ++this.connIdCounter;
+    ws.data.connId = connId;
+    if (this.tuiWs) {
+      this.log(`Secondary TUI connected (conn #${connId}, primary is #${this.tuiConnId})`);
+      this.setupSecondaryConnection(ws, connId);
+      return;
+    }
+    const previousConnId = this.tuiConnId > 0 ? this.tuiConnId : null;
+    this.tuiConnId = connId;
+    this.tuiWs = ws;
+    this.threadId = null;
+    this.log(`TUI connected (conn #${this.tuiConnId})`);
+    this.emit("tuiConnected", this.tuiConnId);
+    if (previousConnId !== null) {
+      this.retireConnectionState(previousConnId);
+    }
+  }
+  setupSecondaryConnection(ws, connId) {
+    const appWs = this.createAppServerConnection();
+    const entry = { tuiWs: ws, appServerWs: appWs, buffer: [] };
+    this.secondaryConnections.set(connId, entry);
+    appWs.onopen = () => {
+      if (!this.secondaryConnections.has(connId)) {
+        appWs.close();
+        return;
+      }
+      this.log(`Secondary conn #${connId}: app-server WS connected, flushing ${entry.buffer.length} buffered messages`);
+      for (const msg of entry.buffer) {
+        try {
+          appWs.send(msg);
+        } catch {}
+      }
+      entry.buffer = [];
+    };
+    appWs.onmessage = (event) => {
+      if (!this.secondaryConnections.has(connId))
+        return;
+      const data = event.data;
+      try {
+        ws.send(data);
+      } catch {}
+    };
+    appWs.onerror = () => {
+      this.log(`Secondary conn #${connId}: app-server WS error`);
+    };
+    appWs.onclose = () => {
+      this.log(`Secondary conn #${connId}: app-server WS closed`);
+      const sec = this.secondaryConnections.get(connId);
+      if (sec) {
+        this.secondaryConnections.delete(connId);
+        try {
+          sec.tuiWs.close();
+        } catch {}
+      }
+    };
+  }
+  replayPendingForThread(resumedThreadId, ws) {
+    const remaining = [];
+    for (const buffered of this.pendingServerRequests) {
+      const belongsToThread = buffered.threadId === null || buffered.threadId === resumedThreadId;
+      if (!belongsToThread) {
+        remaining.push(buffered);
+        continue;
+      }
+      const proxyId = this.nextProxyId++;
+      try {
+        const parsed = JSON.parse(buffered.raw);
+        parsed.id = proxyId;
+        ws.send(JSON.stringify(parsed));
+        this.serverRequestToProxy.set(proxyId, {
+          raw: buffered.raw,
+          serverId: buffered.serverId,
+          connId: this.tuiConnId,
+          method: buffered.method,
+          timestamp: Date.now(),
+          threadId: buffered.threadId
+        });
+        if (buffered.threadId === null) {
+          this.log(`WARNING: Replaying pending server request with unknown threadId (experimental fallback, may surface orphan UI on wrong thread): ${buffered.method} (server id=${buffered.serverId} \u2192 proxy id=${proxyId})`);
+        } else {
+          this.log(`Replayed buffered server request on thread/resume: ${buffered.method} (server id=${buffered.serverId} \u2192 proxy id=${proxyId}, threadId=${buffered.threadId})`);
+        }
+      } catch (e) {
+        this.log(`Failed to replay buffered server request: ${buffered.method} (server id=${buffered.serverId}): ${e.message}`);
+        remaining.push(buffered);
+      }
+    }
+    this.pendingServerRequests = remaining;
+  }
+  dropOrphanPendingRequests(reason, matchThreadId = null) {
+    if (this.pendingServerRequests.length === 0)
+      return;
+    const remaining = [];
+    for (const buffered of this.pendingServerRequests) {
+      const shouldDrop = matchThreadId === null ? true : buffered.threadId !== null && buffered.threadId !== matchThreadId;
+      if (shouldDrop) {
+        this.log(`Dropped orphan pending server request: ${buffered.method} (server id=${buffered.serverId}, threadId=${buffered.threadId ?? "unknown"}, reason=${reason})`);
+        continue;
+      }
+      remaining.push(buffered);
+    }
+    this.pendingServerRequests = remaining;
+  }
+  onTuiDisconnect(ws) {
+    const connId = ws.data.connId;
+    const secondary = this.secondaryConnections.get(connId);
+    if (secondary) {
+      this.log(`Secondary TUI disconnected (conn #${connId})`);
+      this.secondaryConnections.delete(connId);
+      if (secondary.appServerWs) {
+        try {
+          secondary.appServerWs.close();
+        } catch {}
+      }
+      return;
+    }
+    if (this.tuiWs === ws) {
+      const appServerOpen = this.appServerWs?.readyState === WebSocket.OPEN;
+      this.log(`TUI disconnected (conn #${connId}, appServerOpen=${appServerOpen}, turnInProgress=${this.turnInProgress}, pendingTuiMessages=${this.pendingTuiMessages.length}, outageQueue=${this.outageQueue.length}, reconnectingForNewSession=${this.reconnectingForNewSession})`);
+      this.tuiWs = null;
+      if (this.reconnectingForNewSession) {
+        this.log("Clearing pending TUI message buffer (TUI disconnected during app-server reconnect)");
+        this.pendingTuiMessages = [];
+        this.reconnectingForNewSession = false;
+      }
+      if (this.outageQueue.length > 0 || this.outageTimer !== null) {
+        this.log(`Clearing outage queue on TUI disconnect (buffered=${this.outageQueue.length})`);
+        this.outageQueue = [];
+        this.clearOutageTimer();
+      }
+      this.emit("tuiDisconnected", connId);
+    } else {
+      this.log(`Stale TUI disconnected (conn #${connId}, current is #${this.tuiConnId})`);
+    }
+    this.retireConnectionState(connId);
+  }
+  onTuiMessage(ws, msg) {
+    const data = typeof msg === "string" ? msg : msg.toString();
+    const connId = ws.data.connId;
+    const secondary = this.secondaryConnections.get(connId);
+    if (secondary) {
+      if (secondary.appServerWs && secondary.appServerWs.readyState === WebSocket.OPEN) {
+        try {
+          secondary.appServerWs.send(data);
+        } catch {}
+      } else {
+        secondary.buffer.push(data);
+      }
+      return;
+    }
+    if (connId !== this.tuiConnId) {
+      this.log(`Dropping message from stale TUI conn #${connId} (current is #${this.tuiConnId})`);
+      return;
+    }
+    try {
+      const parsed = JSON.parse(data);
+      if (parsed.id !== undefined && !parsed.method) {
+        const normalizedId = this.normalizeNumericId(parsed.id);
+        if (!isNaN(normalizedId) && this.pendingServerResponses.has(normalizedId)) {
+          this.log(`Ignoring duplicate approval response while app-server reconnect is pending (proxy id=${normalizedId})`);
+          return;
+        }
+        const pending = !isNaN(normalizedId) ? this.serverRequestToProxy.get(normalizedId) : undefined;
+        if (pending !== undefined) {
+          if (pending.connId !== connId) {
+            this.log(`Dropping stale server request response (proxy id=${normalizedId}, expected conn #${pending.connId}, got #${connId})`);
+            return;
+          }
+          parsed.id = pending.serverId;
+          const forwardedResponse = JSON.stringify(parsed);
+          if (!this.appServerWs || this.appServerWs.readyState !== WebSocket.OPEN) {
+            this.bufferPendingServerResponse(normalizedId, pending, forwardedResponse, "app-server disconnected");
+            return;
+          }
+          try {
+            this.appServerWs.send(forwardedResponse);
+            this.serverRequestToProxy.delete(normalizedId);
+            this.log(`TUI \u2192 app-server: ${pending.method} response (proxy id=${normalizedId} \u2192 server id=${pending.serverId})`);
+          } catch (e) {
+            this.bufferPendingServerResponse(normalizedId, pending, forwardedResponse, `send failed: ${e.message}`);
+          }
+          return;
+        }
+      }
+    } catch {}
+    let detectedMethod;
+    try {
+      const parsed = JSON.parse(data);
+      detectedMethod = typeof parsed.method === "string" ? parsed.method : undefined;
+    } catch {}
+    if (!this.replayingBufferedMessages) {
+      if (detectedMethod === "initialize") {
+        this.lastInitializeRaw = data;
+        this.log("Detected initialize \u2014 reconnecting app-server for fresh session");
+        this.reconnectingForNewSession = true;
+        this.pendingTuiMessages = [data];
+        this.reconnectAppServerForNewSession(ws);
+        return;
+      }
+      if (this.reconnectingForNewSession) {
+        this.pendingTuiMessages.push(data);
+        return;
+      }
+    }
+    if (detectedMethod === "initialized") {
+      this.lastInitializedRaw = data;
+    }
+    if (!this.appServerWs || this.appServerWs.readyState !== WebSocket.OPEN || this.sessionRestoreInProgress) {
+      if (this.tuiWs && this.tuiWs === ws) {
+        this.bufferDuringOutage(ws, data);
+      } else {
+        this.log(`WARNING: non-primary TUI attempted to send while app-server down \u2014 dropped (connId=${connId})`);
+      }
+      return;
+    }
+    let forwarded = data;
+    try {
+      const parsed = JSON.parse(data);
+      const method = parsed.method ?? `response:${parsed.id}`;
+      this.log(`TUI \u2192 app-server: ${method}`);
+      if (parsed.id !== undefined && parsed.method) {
+        const proxyId = this.nextProxyId++;
+        this.upstreamToClient.set(proxyId, { connId, clientId: parsed.id });
+        this.trackPendingRequest(parsed, connId, proxyId);
+        parsed.id = proxyId;
+        forwarded = JSON.stringify(parsed);
+      } else {
+        this.trackPendingRequest(parsed, connId);
+      }
+    } catch {
+      this.log(`TUI \u2192 app-server: (unparseable)`);
+    }
+    if (this.appServerWs?.readyState === WebSocket.OPEN) {
+      this.appServerWs.send(forwarded);
+    } else {
+      this.log(`WARNING: app-server closed between OPEN check and send \u2014 message lost (connId=${ws.data.connId})`);
+    }
+  }
+  handleAppServerPayload(raw) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (typeof parsed === "object" && parsed !== null && "id" in parsed) {
+        if (this.tryConsumeReplayResponse(parsed)) {
+          return null;
+        }
+      }
+      if (isAppServerNotification(parsed) || typeof parsed === "object" && parsed !== null && !("id" in parsed)) {
+        const notificationLike = parsed;
+        if (notificationLike.method === "thread/closed") {
+          const params = notificationLike.params;
+          const threadId = typeof params?.threadId === "string" ? params.threadId : "unknown";
+          this.log(`DIAGNOSTIC: app-server emitted thread/closed (threadId=${threadId}) \u2014 TUI will exit(0) silently`);
+        }
+        const forwarded = this.patchResponse(notificationLike, raw);
+        this.interceptServerMessage(notificationLike);
+        return forwarded;
+      }
+      if (isAppServerRequestMessage(parsed)) {
+        this.handleServerRequest(parsed, raw);
+        return null;
+      }
+      if (isAppServerResponseMessage(parsed)) {
+        return this.handleAppServerResponse(parsed, raw);
+      }
+      this.log(`Dropping unclassifiable app-server message: ${raw.slice(0, 100)}`);
+      return null;
+    } catch {
+      return raw;
+    }
+  }
+  handleServerRequest(parsed, raw) {
+    const serverId = parsed.id;
+    const method = parsed.method;
+    const threadId = this.extractThreadIdFromParams(parsed.params);
+    if (!this.tuiWs) {
+      this.pendingServerRequests.push({ raw, serverId, method, threadId });
+      this.log(`Server request buffered (no TUI): ${method} (server id=${serverId}, threadId=${threadId ?? "unknown"})`);
+      return;
+    }
+    const proxyId = this.nextProxyId++;
+    parsed.id = proxyId;
+    try {
+      this.tuiWs.send(JSON.stringify(parsed));
+    } catch (e) {
+      this.log(`Server request send failed, buffering: ${method} (server id=${serverId}): ${e.message}`);
+      this.pendingServerRequests.push({ raw, serverId, method, threadId });
+      return;
+    }
+    this.serverRequestToProxy.set(proxyId, {
+      raw,
+      serverId,
+      connId: this.tuiConnId,
+      method,
+      timestamp: Date.now(),
+      threadId
+    });
+    this.log(`Server request: ${method} (server id=${serverId} \u2192 proxy id=${proxyId}, conn #${this.tuiConnId}, threadId=${threadId ?? "unknown"})`);
+  }
+  extractThreadIdFromParams(params) {
+    if (typeof params !== "object" || params === null)
+      return null;
+    const tid = params.threadId;
+    return typeof tid === "string" && tid.length > 0 ? tid : null;
+  }
+  normalizeNumericId(id) {
+    if (typeof id === "number")
+      return id;
+    if (typeof id === "string" && /^-?\d+$/.test(id))
+      return Number(id);
+    return NaN;
+  }
+  bufferPendingServerResponse(proxyId, pending, forwardedResponse, reason) {
+    this.pendingServerResponses.set(proxyId, {
+      raw: forwardedResponse,
+      serverId: pending.serverId,
+      method: pending.method,
+      timestamp: Date.now()
+    });
+    this.serverRequestToProxy.delete(proxyId);
+    this.log(`Buffered approval response until app-server reconnect (${reason}) (proxy id=${proxyId} \u2192 server id=${pending.serverId})`);
+  }
+  flushPendingServerResponses() {
+    if (!this.appServerWs || this.appServerWs.readyState !== WebSocket.OPEN)
+      return;
+    for (const [proxyId, pending] of this.pendingServerResponses.entries()) {
+      try {
+        this.appServerWs.send(pending.raw);
+        this.pendingServerResponses.delete(proxyId);
+        this.log(`Flushed buffered approval response after app-server reconnect (proxy id=${proxyId} \u2192 server id=${pending.serverId})`);
+      } catch (e) {
+        this.log(`Failed to flush buffered approval response (proxy id=${proxyId}): ${e.message}`);
+        break;
+      }
+    }
+  }
+  handleAppServerResponse(parsed, raw) {
+    const responseId = parsed.id;
+    const numericId = this.normalizeNumericId(responseId);
+    const mapping = !isNaN(numericId) ? this.upstreamToClient.get(numericId) : undefined;
+    if (mapping) {
+      this.upstreamToClient.delete(numericId);
+      if (mapping.connId !== this.tuiConnId) {
+        this.log(`Dropping stale response (upstream id ${responseId}, from conn #${mapping.connId}, current #${this.tuiConnId})`);
+        return null;
+      }
+      parsed.id = mapping.clientId;
+      this.log(`app-server \u2192 TUI: response (proxy id=${numericId} \u2192 client id=${String(mapping.clientId)}, conn #${mapping.connId})`);
+      const forwarded = this.patchResponse(parsed, JSON.stringify(parsed));
+      this.interceptServerMessage(parsed, mapping.connId);
+      return forwarded;
+    }
+    if (!isNaN(numericId) && this.consumeBridgeRequestId(numericId)) {
+      if (parsed.error) {
+        this.log(`Bridge-originated request failed (id ${responseId}): ${parsed.error.message ?? "unknown error"}`);
+      } else {
+        this.log(`Bridge-originated request completed (id ${responseId})`);
+      }
+      return null;
+    }
+    if (!isNaN(numericId) && this.consumeStaleProxyId(numericId)) {
+      this.log(`Dropping stale response for retired upstream id ${responseId}`);
+      return null;
+    }
+    this.log(`Dropping unmatched app-server response id ${String(responseId)}`);
+    return null;
+  }
+  patchResponse(parsed, raw) {
+    if (isAppServerResponseMessage(parsed) && parsed.error && parsed.id !== undefined) {
+      const errMsg = parsed.error.message ?? "";
+      if (errMsg.includes("rate limits") || errMsg.includes("rateLimits")) {
+        this.log(`Patching rateLimits error \u2192 mock success (id: ${parsed.id})`);
+        return JSON.stringify({
+          id: parsed.id,
+          result: {
+            rateLimits: {
+              limitId: null,
+              limitName: null,
+              primary: { usedPercent: 0, windowDurationMins: 60, resetsAt: null },
+              secondary: null,
+              credits: null,
+              planType: null
+            },
+            rateLimitsByLimitId: null
+          }
+        });
+      }
+    }
+    return raw;
+  }
+  interceptServerMessage(msg, connId) {
+    this.handleTrackedResponse(msg, connId);
+    if ("method" in msg && typeof msg.method === "string" && isAppServerNotification(msg)) {
+      this.handleServerNotification(msg);
+    }
+  }
+  handleServerNotification(msg) {
+    const { method, params } = msg;
+    switch (method) {
+      case "turn/started":
+        this.markTurnStarted(params?.turn?.id);
+        break;
+      case "item/started": {
+        const item = params?.item;
+        if (item?.type === "agentMessage")
+          this.agentMessageBuffers.set(item.id, []);
+        break;
+      }
+      case "item/agentMessage/delta": {
+        const itemId = params?.itemId;
+        if (typeof itemId !== "string")
+          break;
+        const buf = this.agentMessageBuffers.get(itemId);
+        if (buf && params?.delta)
+          buf.push(params.delta);
+        break;
+      }
+      case "item/completed": {
+        const item = params?.item;
+        if (item?.type === "agentMessage") {
+          const content = this.extractContent(item);
+          this.agentMessageBuffers.delete(item.id);
+          if (content) {
+            this.log(`Agent message completed (${content.length} chars)`);
+            this.emit("agentMessage", {
+              id: item.id,
+              source: "codex",
+              content,
+              timestamp: Date.now()
+            });
+          }
+        }
+        break;
+      }
+      case "turn/completed": {
+        const wasInProgress = this.turnInProgress;
+        this.markTurnCompleted(params?.turn?.id);
+        if (wasInProgress && !this.turnInProgress) {
+          this.emit("turnCompleted");
+        }
+        break;
+      }
+    }
+  }
+  extractContent(item) {
+    if (item.content?.length) {
+      return item.content.filter((c) => c.type === "text" && c.text).map((c) => c.text).join("");
+    }
+    return this.agentMessageBuffers.get(item.id)?.join("") ?? "";
+  }
+  pendingKey(rpcId, connId) {
+    const base = this.requestKey(rpcId);
+    if (!base)
+      return null;
+    return `${connId ?? this.tuiConnId}:${base}`;
+  }
+  trackPendingRequest(message, connId, _proxyId) {
+    const rpcId = "id" in message ? message.id : undefined;
+    const method = "method" in message && typeof message.method === "string" ? message.method : undefined;
+    const key = this.pendingKey(rpcId, connId);
+    if (!key || !isTrackedAppServerRequestMethod(method))
+      return;
+    const pending = { method };
+    if (method === "turn/start") {
+      const params = "params" in message && typeof message.params === "object" && message.params !== null ? message.params : undefined;
+      const threadId = params?.threadId;
+      if (typeof threadId === "string" && threadId.length > 0) {
+        pending.threadId = threadId;
+      }
+    }
+    if (this.pendingRequests.has(key)) {
+      this.log(`WARNING: overwriting pending request for key ${key}`);
+    }
+    this.pendingRequests.set(key, pending);
+  }
+  handleTrackedResponse(message, connId) {
+    const key = this.pendingKey(message?.id, connId);
+    if (!key)
+      return;
+    const pending = this.pendingRequests.get(key);
+    if (!pending) {
+      if (message?.result?.thread?.id) {
+        this.log(`[track-resp] Unmatched response with thread.id=${message.result.thread.id}, key=${key}, pending keys=[${[...this.pendingRequests.keys()].join(",")}]`);
+      }
+      return;
+    }
+    this.pendingRequests.delete(key);
+    if (message?.error) {
+      this.log(`Tracked request failed (${pending.method}, id ${key}): ${message.error.message ?? "unknown error"}`);
+      return;
+    }
+    switch (pending.method) {
+      case "thread/start": {
+        const threadId = message?.result?.thread?.id;
+        if (typeof threadId === "string" && threadId.length > 0) {
+          this.setActiveThreadId(threadId, `thread/start response ${key}`);
+        }
+        this.dropOrphanPendingRequests(`thread/start (new session)`);
+        break;
+      }
+      case "thread/resume": {
+        const threadId = message?.result?.thread?.id;
+        if (typeof threadId === "string" && threadId.length > 0) {
+          this.setActiveThreadId(threadId, `thread/resume response ${key}`);
+          if (this.tuiWs) {
+            this.replayPendingForThread(threadId, this.tuiWs);
+          }
+          this.dropOrphanPendingRequests(`thread/resume to ${threadId}`, threadId);
+        }
+        break;
+      }
+      case "turn/start":
+        if (pending.threadId) {
+          this.setActiveThreadId(pending.threadId, `turn/start response ${key}`);
+        }
+        break;
+    }
+  }
+  setActiveThreadId(threadId, reason) {
+    if (this.threadId === threadId)
+      return;
+    const previousThreadId = this.threadId;
+    this.threadId = threadId;
+    if (previousThreadId) {
+      this.log(`Active thread changed: ${previousThreadId} \u2192 ${threadId} (${reason})`);
+      return;
+    }
+    this.log(`Thread detected: ${threadId} (${reason})`);
+    this.emit("ready", threadId);
+  }
+  markTurnStarted(turnId) {
+    const wasInProgress = this.turnInProgress;
+    if (typeof turnId === "string" && turnId.length > 0) {
+      this.activeTurnIds.add(turnId);
+    } else {
+      this.activeTurnIds.add(`unknown:${Date.now()}`);
+    }
+    this.turnInProgress = this.activeTurnIds.size > 0;
+    if (!wasInProgress && this.turnInProgress) {
+      this.emit("turnStarted");
+    }
+  }
+  markTurnCompleted(turnId) {
+    if (typeof turnId === "string" && turnId.length > 0) {
+      this.activeTurnIds.delete(turnId);
+    } else {
+      this.activeTurnIds.clear();
+    }
+    this.turnInProgress = this.activeTurnIds.size > 0;
+  }
+  requestKey(id) {
+    if (typeof id === "number" || typeof id === "string")
+      return String(id);
+    return null;
+  }
+  retireConnectionState(connId) {
+    const prefix = `${connId}:`;
+    for (const key of this.pendingRequests.keys()) {
+      if (key.startsWith(prefix))
+        this.pendingRequests.delete(key);
+    }
+    for (const [upId, mapping] of this.upstreamToClient.entries()) {
+      if (mapping.connId !== connId)
+        continue;
+      this.upstreamToClient.delete(upId);
+      this.trackStaleProxyId(upId);
+    }
+    const requeuedServerRequests = [];
+    for (const [proxyId, pending] of this.serverRequestToProxy.entries()) {
+      if (pending.connId === connId) {
+        this.serverRequestToProxy.delete(proxyId);
+        requeuedServerRequests.push({
+          raw: pending.raw,
+          serverId: pending.serverId,
+          method: pending.method,
+          threadId: pending.threadId
+        });
+        this.log(`Requeued in-flight server request after TUI disconnect (proxy id=${proxyId}, server id=${pending.serverId}, method=${pending.method}, threadId=${pending.threadId ?? "unknown"})`);
+      }
+    }
+    if (requeuedServerRequests.length === 0)
+      return;
+    this.pendingServerRequests.push(...requeuedServerRequests);
+  }
+  trackStaleProxyId(proxyId) {
+    this.clearTrackedId(this.staleProxyIds, proxyId);
+    const timer = setTimeout(() => {
+      this.staleProxyIds.delete(proxyId);
+    }, CodexAdapter.RESPONSE_TRACKING_TTL_MS);
+    timer.unref?.();
+    this.staleProxyIds.set(proxyId, timer);
+  }
+  consumeStaleProxyId(proxyId) {
+    return this.clearTrackedId(this.staleProxyIds, proxyId);
+  }
+  trackBridgeRequestId(requestId) {
+    this.clearTrackedId(this.bridgeRequestIds, requestId);
+    const timer = setTimeout(() => {
+      this.bridgeRequestIds.delete(requestId);
+    }, CodexAdapter.RESPONSE_TRACKING_TTL_MS);
+    timer.unref?.();
+    this.bridgeRequestIds.set(requestId, timer);
+  }
+  consumeBridgeRequestId(requestId) {
+    return this.clearTrackedId(this.bridgeRequestIds, requestId);
+  }
+  untrackBridgeRequestId(requestId) {
+    this.clearTrackedId(this.bridgeRequestIds, requestId);
+  }
+  clearTrackedId(store, id) {
+    const timer = store.get(id);
+    if (!timer)
+      return false;
+    clearTimeout(timer);
+    store.delete(id);
+    return true;
+  }
+  clearTransientResponseTrackingState() {
+    this.pendingRequests.clear();
+    this.upstreamToClient.clear();
+    for (const timer of this.staleProxyIds.values()) {
+      clearTimeout(timer);
+    }
+    this.staleProxyIds.clear();
+    for (const timer of this.bridgeRequestIds.values()) {
+      clearTimeout(timer);
+    }
+    this.bridgeRequestIds.clear();
+  }
+  clearResponseTrackingState() {
+    this.clearTransientResponseTrackingState();
+    this.serverRequestToProxy.clear();
+    this.pendingServerRequests = [];
+    this.pendingServerResponses.clear();
+  }
+  clearResponseTrackingStateForAppServerReconnect() {
+    this.clearTransientResponseTrackingState();
+    for (const pending of this.serverRequestToProxy.values()) {
+      this.pendingServerRequests.push({
+        raw: pending.raw,
+        serverId: pending.serverId,
+        method: pending.method,
+        threadId: pending.threadId
+      });
+      this.log(`Requeued in-flight server request on app-server reconnect (server id=${pending.serverId}, method=${pending.method}, threadId=${pending.threadId ?? "unknown"})`);
+    }
+    this.serverRequestToProxy.clear();
+    this.pendingServerResponses.clear();
+  }
+  static buildPortListenLsofCommand(port) {
+    return `lsof -ti tcp:${port} -sTCP:LISTEN`;
+  }
+  async checkPorts() {
+    for (const port of [this.proxyPort]) {
+      try {
+        const pids = execSync(CodexAdapter.buildPortListenLsofCommand(port), {
+          encoding: "utf-8"
+        }).trim();
+        if (!pids)
+          continue;
+        const pidList = pids.split(`
+`).map((p) => p.trim()).filter(Boolean);
+        const staleCodexPids = [];
+        const foreignPids = [];
+        for (const pid of pidList) {
+          try {
+            const cmdline = execSync(`ps -p ${pid} -o args=`, { encoding: "utf-8" }).trim();
+            if (cmdline.includes("codex") && cmdline.includes("app-server")) {
+              staleCodexPids.push(pid);
+            } else {
+              foreignPids.push(pid);
+            }
+          } catch {}
+        }
+        if (staleCodexPids.length > 0) {
+          this.log(`Cleaning up stale codex app-server on port ${port}: PID(s) ${staleCodexPids.join(", ")}`);
+          for (const pid of staleCodexPids) {
+            try {
+              execSync(`kill ${pid}`, { encoding: "utf-8" });
+            } catch {}
+          }
+          await new Promise((r) => setTimeout(r, 500));
+        }
+        if (foreignPids.length > 0) {
+          throw new Error(`Port ${port} is already in use by non-Codex process(es): PID(s) ${foreignPids.join(", ")}. ` + `Please stop the process or set a different port via CODEX_PROXY_PORT env var.`);
+        }
+        try {
+          const remaining = execSync(CodexAdapter.buildPortListenLsofCommand(port), {
+            encoding: "utf-8"
+          }).trim();
+          if (remaining) {
+            throw new Error(`Port ${port} is still occupied (PID(s): ${remaining.replace(/\n/g, ", ")}) after cleanup. ` + `Please stop the process or set a different port via CODEX_PROXY_PORT env var.`);
+          }
+        } catch (err) {
+          if (err.message?.includes("Port"))
+            throw err;
+        }
+      } catch (err) {
+        if (err.message?.includes("Port") || err.message?.includes("non-Codex"))
+          throw err;
+      }
+    }
+  }
+  log(msg) {
+    const line = `[${new Date().toISOString()}] [CodexAdapter] ${msg}
+`;
+    process.stderr.write(line);
+    try {
+      appendFileSync(this.logFile, line);
+    } catch {}
+  }
+}
+
+// src/kimi-adapter.ts
+import { spawn as spawn2 } from "child_process";
+import { createInterface as createInterface2 } from "readline";
+import { EventEmitter as EventEmitter2 } from "events";
+import { appendFileSync as appendFileSync2 } from "fs";
+class KimiAdapter extends EventEmitter2 {
+  static REQUEST_TIMEOUT_MS = 30000;
+  static TURN_TIMEOUT_MS = Number(process.env.KIMI_TURN_TIMEOUT_MS) || 7200000;
+  child = null;
+  stopped = false;
+  suppressExitEvent = false;
+  logFile;
+  nextRequestId = 1;
+  pendingRequests = new Map;
+  sessionId = null;
+  initialized = false;
+  initializing = false;
+  turnInProgress = false;
+  messageBuffer = [];
+  statusBuffer = [];
+  thoughtBuffer = [];
+  currentPromptId = null;
+  constructor(logFile = new StateDirResolver().logFile) {
+    super();
+    this.logFile = logFile;
+  }
+  get appServerUrl() {
+    return "acp://kimi";
+  }
+  get proxyUrl() {
+    return "(direct stdio)";
+  }
+  get activeThreadId() {
+    return this.sessionId;
+  }
+  async start() {
+    this.stopped = false;
+    const kimiBin = process.env.KIMI_BIN ?? "/Users/lji/.kimi-code/bin/kimi";
+    const workDir = process.env.KIMI_WORK_DIR ?? process.cwd();
+    const extraAcpArgs = (process.env.KIMI_ACP_ARGS ?? "").split(/\s+/).filter(Boolean);
+    const acpArgs = ["acp", ...extraAcpArgs];
+    this.log(`Spawning kimi acp subprocess: ${kimiBin} ${acpArgs.join(" ")}`);
+    this.child = spawn2(kimiBin, acpArgs, {
+      stdio: ["pipe", "pipe", "pipe"],
+      cwd: workDir,
+      env: { ...process.env }
+    });
+    this.child.on("error", (err) => {
+      this.log(`kimi acp spawn error: ${err.message}`);
+      this.emit("error", err);
+    });
+    this.child.on("exit", (code, signal) => {
+      this.log(`kimi acp exited (code=${code}, signal=${signal})`);
+      this.cleanupPendingRequests(new Error(`kimi acp exited (code=${code})`));
+      if (!this.suppressExitEvent) {
+        this.emit("exit", code);
+      }
+    });
+    if (this.child.stdout) {
+      const rl = createInterface2({ input: this.child.stdout });
+      rl.on("line", (line) => this.handleMessage(line));
+    }
+    if (this.child.stderr) {
+      const rl = createInterface2({ input: this.child.stderr });
+      rl.on("line", (line) => this.log(`[kimi] ${line}`));
+    }
+    await this.initialize();
+    await this.createSession();
+    this.log("Kimi adapter ready");
+    this.emit("ready", this.sessionId ?? "unknown");
+    this.emit("tuiConnected", 1);
+  }
+  injectMessage(text) {
+    if (!this.sessionId) {
+      this.log("Cannot inject: no active session");
+      return false;
+    }
+    if (!this.child?.stdin?.writable) {
+      this.log("Cannot inject: kimi stdin not writable");
+      return false;
+    }
+    if (this.turnInProgress) {
+      this.log(`Rejected injection: turn in progress (session ${this.sessionId})`);
+      return false;
+    }
+    this.turnInProgress = true;
+    this.messageBuffer = [];
+    this.statusBuffer = [];
+    this.thoughtBuffer = [];
+    this.emit("turnStarted");
+    this.log(`Injecting message into Kimi (${text.length} chars)`);
+    const id = this.nextRequestId++;
+    this.currentPromptId = id;
+    const promise = this.sendRequest("session/prompt", {
+      sessionId: this.sessionId,
+      prompt: [{ type: "text", text }]
+    }, KimiAdapter.TURN_TIMEOUT_MS);
+    promise.then((resp) => {
+      this.handlePromptResponse(resp);
+    }).catch((err) => {
+      this.log(`session/prompt failed: ${err.message}`);
+      this.turnInProgress = false;
+      this.currentPromptId = null;
+      this.emit("turnCompleted");
+    });
+    return true;
+  }
+  disconnect() {
+    this.stop();
+  }
+  stop() {
+    this.stopped = true;
+    this.cleanupPendingRequests(new Error("adapter stopped"));
+    this.killChild();
+  }
+  async resetSession() {
+    this.log("Resetting Kimi session \u2014 killing old process, starting fresh");
+    this.cleanupPendingRequests(new Error("session reset"));
+    this.suppressExitEvent = true;
+    this.killChild();
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    this.sessionId = null;
+    this.initialized = false;
+    this.turnInProgress = false;
+    this.messageBuffer = [];
+    this.statusBuffer = [];
+    this.thoughtBuffer = [];
+    this.suppressExitEvent = false;
+    await this.start();
+    this.log(`Session reset complete \u2014 new sessionId=${this.sessionId}`);
+  }
+  killChild() {
+    if (this.child) {
+      try {
+        this.child.stdin?.end();
+      } catch {}
+      try {
+        this.child.kill("SIGTERM");
+      } catch {}
+      const killTimer = setTimeout(() => {
+        try {
+          this.child?.kill("SIGKILL");
+        } catch {}
+      }, 2000);
+      this.child.once("exit", () => clearTimeout(killTimer));
+      this.child = null;
+    }
+  }
+  async initialize() {
+    if (this.initialized || this.initializing)
+      return;
+    this.initializing = true;
+    const resp = await this.sendRequest("initialize", {
+      protocolVersion: 1,
+      clientInfo: { name: "agentbridge", version: "0.1.6" },
+      clientCapabilities: {}
+    }, KimiAdapter.REQUEST_TIMEOUT_MS);
+    if (resp.error) {
+      throw new Error(`ACP initialize failed: ${resp.error.message}`);
+    }
+    this.sendNotification("notifications/initialized", {});
+    this.initialized = true;
+    this.initializing = false;
+    this.log("ACP initialized");
+  }
+  async createSession() {
+    const workDir = process.env.KIMI_WORK_DIR ?? process.cwd();
+    const resp = await this.sendRequest("session/new", {
+      cwd: workDir,
+      mcpServers: []
+    }, KimiAdapter.REQUEST_TIMEOUT_MS);
+    if (resp.error) {
+      throw new Error(`ACP session/new failed: ${resp.error.message}`);
+    }
+    this.sessionId = resp.result?.sessionId ?? null;
+    if (!this.sessionId) {
+      throw new Error("ACP session/new returned no sessionId");
+    }
+    this.log(`ACP session created: ${this.sessionId}`);
+  }
+  handleMessage(raw) {
+    let msg;
+    try {
+      msg = JSON.parse(raw);
+    } catch {
+      this.log(`Unparseable line from kimi: ${raw.slice(0, 100)}`);
+      return;
+    }
+    if ("id" in msg && msg.id !== undefined && !("method" in msg)) {
+      this.resolveRequest(msg.id, msg);
+      return;
+    }
+    if ("method" in msg && !("id" in msg)) {
+      this.handleNotification(msg);
+      return;
+    }
+    if ("id" in msg && "method" in msg) {
+      this.handleServerRequest(msg);
+      return;
+    }
+  }
+  handleNotification(msg) {
+    if (msg.method === "session/update") {
+      this.handleSessionUpdate(msg.params);
+    }
+  }
+  handleSessionUpdate(params) {
+    if (!params)
+      return;
+    const update = params.update;
+    if (!update)
+      return;
+    const type = update.sessionUpdate ?? update.type;
+    const content = update.content;
+    switch (type) {
+      case "agent_message_chunk": {
+        const text = content?.text ?? update.text;
+        if (text) {
+          this.messageBuffer.push(text);
+          this.statusBuffer.push(text);
+          this.log(`message chunk: ${text.slice(0, 60)}`);
+        }
+        break;
+      }
+      case "agent_thought_chunk": {
+        const thought = content?.text ?? update.thought;
+        if (thought) {
+          this.thoughtBuffer.push(thought);
+        }
+        break;
+      }
+      default:
+        this.flushStatus();
+        this.log(`session/update type=${type}`);
+        break;
+    }
+  }
+  handlePromptResponse(resp) {
+    const stopReason = resp.result?.stopReason ?? "unknown";
+    const fullMessage = this.messageBuffer.join("");
+    this.log(`Turn completed (stopReason=${stopReason}, message=${fullMessage.length} chars)`);
+    if (fullMessage.length > 0) {
+      this.emit("agentMessage", {
+        id: `kimi_${Date.now()}`,
+        source: "codex",
+        content: fullMessage,
+        timestamp: Date.now()
+      });
+    }
+    this.turnInProgress = false;
+    this.currentPromptId = null;
+    this.messageBuffer = [];
+    this.statusBuffer = [];
+    this.thoughtBuffer = [];
+    this.emit("turnCompleted");
+  }
+  flushStatus() {
+    const text = this.statusBuffer.join("").trim();
+    if (!text)
+      return;
+    this.statusBuffer = [];
+    this.emit("agentMessage", {
+      id: `kimi_status_${Date.now()}`,
+      source: "codex",
+      content: `[STATUS] ${text}`,
+      timestamp: Date.now()
+    });
+    this.log(`forwarded [STATUS] narration (${text.length} chars)`);
+  }
+  handleServerRequest(req) {
+    if (req.method === "session/request_permission") {
+      const params = req.params;
+      const options = Array.isArray(params?.options) ? params.options : [];
+      const pick = options.find((o) => o?.kind === "allow_always") ?? options.find((o) => o?.kind === "allow_once") ?? options.find((o) => /allow|approve|yes|grant/i.test(`${o?.optionId ?? ""} ${o?.name ?? ""} ${o?.kind ?? ""}`)) ?? options[0];
+      this.log(`Server request: session/request_permission (id=${req.id}) \u2014 options=${JSON.stringify(options)} \u2192 granting optionId=${pick?.optionId}`);
+      this.sendRaw({
+        jsonrpc: "2.0",
+        id: req.id,
+        result: pick?.optionId ? { outcome: { outcome: "selected", optionId: pick.optionId } } : { outcome: { outcome: "cancelled" } }
+      });
+      return;
+    }
+    this.log(`Server request: ${req.method} (id=${req.id}) \u2014 auto-approving (empty result)`);
+    this.sendRaw({ jsonrpc: "2.0", id: req.id, result: {} });
+  }
+  sendRequest(method, params, timeoutMs) {
+    const id = this.nextRequestId++;
+    const request = { jsonrpc: "2.0", id, method, params };
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pendingRequests.delete(id);
+        reject(new Error(`Request timeout (${timeoutMs}ms): ${method}`));
+      }, timeoutMs);
+      this.pendingRequests.set(id, { resolve, reject, timer });
+      try {
+        this.sendRaw(request);
+      } catch (err) {
+        clearTimeout(timer);
+        this.pendingRequests.delete(id);
+        reject(new Error(`Send failed for ${method}: ${err.message}`));
+      }
+    });
+  }
+  sendNotification(method, params) {
+    this.sendRaw({ jsonrpc: "2.0", method, params });
+  }
+  sendRaw(msg) {
+    if (!this.child?.stdin?.writable) {
+      throw new Error("kimi stdin not writable");
+    }
+    const line = JSON.stringify(msg);
+    this.child.stdin.write(line.endsWith(`
+`) ? line : `${line}
+`);
+  }
+  resolveRequest(id, resp) {
+    const pending = this.pendingRequests.get(id);
+    if (!pending) {
+      this.log(`Unmatched response id=${id}`);
+      return;
+    }
+    clearTimeout(pending.timer);
+    this.pendingRequests.delete(id);
+    pending.resolve(resp);
+  }
+  cleanupPendingRequests(error) {
+    for (const [, pending] of this.pendingRequests) {
+      clearTimeout(pending.timer);
+      pending.reject(error);
+    }
+    this.pendingRequests.clear();
+  }
+  log(msg) {
+    const line = `[${new Date().toISOString()}] [KimiAdapter] ${msg}
+`;
+    process.stderr.write(line);
+    try {
+      appendFileSync2(this.logFile, line);
+    } catch {}
+  }
+}
+
+// src/zcode-adapter.ts
+import { spawn as spawn3 } from "child_process";
+import { createInterface as createInterface3 } from "readline";
+import { EventEmitter as EventEmitter3 } from "events";
+import { appendFileSync as appendFileSync3 } from "fs";
+import { homedir as homedir2 } from "os";
+import { join as join2 } from "path";
+class ZcodeAdapter extends EventEmitter3 {
+  static REQUEST_TIMEOUT_MS = 30000;
+  static TURN_TIMEOUT_MS = Number(process.env.ZCODE_TURN_TIMEOUT_MS) || 7200000;
+  child = null;
+  stopped = false;
+  suppressExitEvent = false;
+  logFile;
+  nextRequestId = 1;
+  pendingRequests = new Map;
+  sessionId = null;
+  initialized = false;
+  turnInProgress = false;
+  messageBuffer = [];
+  statusBuffer = [];
+  currentSendId = null;
+  constructor(logFile = new StateDirResolver().logFile) {
+    super();
+    this.logFile = logFile;
+  }
+  get appServerUrl() {
+    return "zcode://app-server";
+  }
+  get proxyUrl() {
+    return "(direct stdio)";
+  }
+  get activeThreadId() {
+    return this.sessionId;
+  }
+  async start() {
+    this.stopped = false;
+    const zcodeBin = process.env.ZCODE_BIN ?? join2(homedir2(), ".zcode/server/agents/glm/zcode-agent");
+    const workDir = process.env.ZCODE_WORK_DIR ?? process.cwd();
+    const extraArgs = (process.env.ZCODE_APP_SERVER_ARGS ?? "").split(/\s+/).filter(Boolean);
+    const args = ["app-server", "--stdio", ...extraArgs];
+    this.log(`Spawning zcode app-server subprocess: ${zcodeBin} ${args.join(" ")}`);
+    this.child = spawn3(zcodeBin, args, {
+      stdio: ["pipe", "pipe", "pipe"],
+      cwd: workDir,
+      env: { ...process.env }
+    });
+    this.child.on("error", (err) => {
+      this.log(`zcode app-server spawn error: ${err.message}`);
+      this.emit("error", err);
+    });
+    this.child.on("exit", (code, signal) => {
+      this.log(`zcode app-server exited (code=${code}, signal=${signal})`);
+      this.cleanupPendingRequests(new Error(`zcode app-server exited (code=${code})`));
+      if (this.turnInProgress) {
+        const reason = signal ? `signal ${signal}` : `exit code ${code ?? "unknown"}`;
+        this.log(`Turn aborted: zcode process died mid-turn (${reason})`);
+        this.emit("agentMessage", {
+          id: `zcode_crash_${Date.now()}`,
+          source: "codex",
+          content: `[STATUS] \u26A0\uFE0F ZCode process exited unexpectedly (${reason}) during this turn. The turn was aborted. You may want to retry or check ZCode status.`,
+          timestamp: Date.now()
+        });
+        this.turnInProgress = false;
+        this.currentSendId = null;
+        this.messageBuffer = [];
+        this.statusBuffer = [];
+        this.emit("turnCompleted");
+      }
+      if (!this.suppressExitEvent) {
+        this.emit("exit", code);
+      }
+    });
+    if (this.child.stdout) {
+      const rl = createInterface3({ input: this.child.stdout });
+      rl.on("line", (line) => this.handleMessage(line));
+    }
+    if (this.child.stderr) {
+      const rl = createInterface3({ input: this.child.stderr });
+      rl.on("line", (line) => this.log(`[zcode] ${line}`));
+    }
+    await this.createSession();
+    this.log("ZCode adapter ready");
+    this.emit("ready", this.sessionId ?? "unknown");
+    this.emit("tuiConnected", 1);
+  }
+  injectMessage(text) {
+    if (!this.sessionId) {
+      this.log("Cannot inject: no active session");
+      return false;
+    }
+    if (!this.child?.stdin?.writable) {
+      this.log("Cannot inject: zcode stdin not writable");
+      return false;
+    }
+    if (this.turnInProgress) {
+      this.log(`Rejected injection: turn in progress (session ${this.sessionId})`);
+      return false;
+    }
+    this.turnInProgress = true;
+    this.messageBuffer = [];
+    this.statusBuffer = [];
+    this.emit("turnStarted");
+    this.log(`Injecting message into ZCode (${text.length} chars)`);
+    const id = this.nextRequestId++;
+    this.currentSendId = id;
+    const promise = this.sendRequest("session/send", {
+      sessionId: this.sessionId,
+      content: text
+    }, ZcodeAdapter.TURN_TIMEOUT_MS);
+    promise.then((resp) => {
+      this.handleSendResponse(resp);
+    }).catch((err) => {
+      this.log(`session/send failed: ${err.message}`);
+      this.turnInProgress = false;
+      this.currentSendId = null;
+      this.emit("turnCompleted");
+    });
+    return true;
+  }
+  disconnect() {
+    this.stop();
+  }
+  stop() {
+    this.stopped = true;
+    this.cleanupPendingRequests(new Error("adapter stopped"));
+    this.killChild();
+  }
+  async resetSession() {
+    this.log("Resetting ZCode session \u2014 killing old process, starting fresh");
+    this.cleanupPendingRequests(new Error("session reset"));
+    this.suppressExitEvent = true;
+    this.killChild();
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    this.sessionId = null;
+    this.initialized = false;
+    this.turnInProgress = false;
+    this.messageBuffer = [];
+    this.statusBuffer = [];
+    this.suppressExitEvent = false;
+    await this.start();
+    this.log(`Session reset complete \u2014 new sessionId=${this.sessionId}`);
+  }
+  killChild() {
+    if (this.child) {
+      try {
+        this.child.stdin?.end();
+      } catch {}
+      try {
+        this.child.kill("SIGTERM");
+      } catch {}
+      const killTimer = setTimeout(() => {
+        try {
+          this.child?.kill("SIGKILL");
+        } catch {}
+      }, 2000);
+      this.child.once("exit", () => clearTimeout(killTimer));
+      this.child = null;
+    }
+  }
+  resolveWorkspace() {
+    const workspacePath = process.env.ZCODE_WORK_DIR ?? process.cwd();
+    const workspaceKey = process.env.ZCODE_WORKSPACE_KEY ?? workspacePath;
+    return { workspacePath, workspaceKey };
+  }
+  async createSession() {
+    if (this.sessionId)
+      return;
+    const workspace = this.resolveWorkspace();
+    const resp = await this.sendRequest("session/create", {
+      workspace,
+      mode: process.env.ZCODE_SESSION_MODE ?? "yolo"
+    }, ZcodeAdapter.REQUEST_TIMEOUT_MS);
+    if (resp.error) {
+      throw new Error(`ZCode session/create failed: ${resp.error.message}`);
+    }
+    const sid = resp.result?.session?.sessionId;
+    if (typeof sid !== "string" || !sid) {
+      throw new Error("ZCode session/create returned no sessionId");
+    }
+    this.sessionId = sid;
+    this.initialized = true;
+    this.log(`ZCode session created: ${this.sessionId}`);
+    await this.sendRequest("session/subscribe", { sessionId: this.sessionId, deliveryKind: "desktop-continuous", includeSnapshot: false }, ZcodeAdapter.REQUEST_TIMEOUT_MS);
+    this.log(`Subscribed to session events: ${this.sessionId}`);
+  }
+  handleMessage(raw) {
+    let msg;
+    try {
+      msg = JSON.parse(raw);
+    } catch {
+      this.log(`Unparseable line from zcode: ${raw.slice(0, 100)}`);
+      return;
+    }
+    if ("id" in msg && msg.id !== undefined && !("method" in msg)) {
+      this.resolveRequest(msg.id, msg);
+      return;
+    }
+    if ("method" in msg && !("id" in msg)) {
+      this.handleNotification(msg);
+      return;
+    }
+    if ("id" in msg && "method" in msg) {
+      this.handleServerRequest(msg);
+      return;
+    }
+  }
+  handleNotification(msg) {
+    switch (msg.method) {
+      case "session/event":
+        this.handleSessionEvent(msg.params);
+        break;
+      case "state.updated":
+        break;
+      default:
+        this.log(`notification: ${msg.method}`);
+        break;
+    }
+  }
+  handleSessionEvent(params) {
+    if (!params)
+      return;
+    const type = params.type;
+    if (!type)
+      return;
+    const payload = params.payload ?? {};
+    switch (type) {
+      case "turn.started":
+        break;
+      case "model.streaming": {
+        const text = typeof payload.delta === "string" ? payload.delta : "";
+        if (text) {
+          this.messageBuffer.push(text);
+          this.statusBuffer.push(text);
+        }
+        break;
+      }
+      case "part.delta": {
+        const text = this.extractDeltaText(payload);
+        if (text) {
+          this.messageBuffer.push(text);
+          this.statusBuffer.push(text);
+        }
+        break;
+      }
+      case "part.started":
+      case "part.upserted": {
+        const text = this.extractPartText(payload);
+        if (text) {
+          this.messageBuffer.push(text);
+          this.statusBuffer.push(text);
+        }
+        break;
+      }
+      case "tool.updated":
+        this.flushStatus();
+        break;
+      case "turn.completed": {
+        const response = typeof payload.response === "string" ? payload.response : "";
+        const fullMessage = this.messageBuffer.join("").trim() || response.trim();
+        this.log(`Turn completed (resultType=${payload.resultType ?? "unknown"}, message=${fullMessage.length} chars)`);
+        this.flushStatus();
+        if (fullMessage.length > 0) {
+          this.emit("agentMessage", {
+            id: `zcode_${Date.now()}`,
+            source: "codex",
+            content: fullMessage,
+            timestamp: Date.now()
+          });
+        }
+        this.turnInProgress = false;
+        this.currentSendId = null;
+        this.messageBuffer = [];
+        this.statusBuffer = [];
+        this.emit("turnCompleted");
+        break;
+      }
+      case "turn.failed": {
+        const errMsg = payload.error instanceof Object && "message" in payload.error ? String(payload.error.message ?? "unknown") : JSON.stringify(payload.error ?? payload).slice(0, 200);
+        this.log(`Turn failed: ${errMsg}`);
+        this.flushStatus();
+        this.turnInProgress = false;
+        this.currentSendId = null;
+        this.messageBuffer = [];
+        this.statusBuffer = [];
+        this.emit("turnCompleted");
+        break;
+      }
+      default:
+        break;
+    }
+  }
+  extractDeltaText(params) {
+    const direct = typeof params.text === "string" && params.text || typeof params.delta === "string" && params.delta || "";
+    if (direct)
+      return direct;
+    const part = params.part;
+    if (part) {
+      if (typeof part.text === "string")
+        return part.text;
+      if (typeof part.delta === "string")
+        return part.delta;
+    }
+    return "";
+  }
+  extractPartText(params) {
+    const part = params.part;
+    if (part) {
+      if (typeof part.text === "string")
+        return part.text;
+      if (typeof part.content === "string")
+        return part.content;
+    }
+    if (typeof params.text === "string")
+      return params.text;
+    return "";
+  }
+  handleSendResponse(resp) {
+    if (resp.error) {
+      this.log(`session/send error: ${resp.error.message}`);
+      this.turnInProgress = false;
+      this.currentSendId = null;
+      this.emit("turnCompleted");
+    }
+  }
+  flushStatus() {
+    const text = this.statusBuffer.join("").trim();
+    if (!text)
+      return;
+    this.statusBuffer = [];
+    this.emit("agentMessage", {
+      id: `zcode_status_${Date.now()}`,
+      source: "codex",
+      content: `[STATUS] ${text}`,
+      timestamp: Date.now()
+    });
+    this.log(`forwarded [STATUS] narration (${text.length} chars)`);
+  }
+  handleServerRequest(req) {
+    if (req.method === "interaction/requestPermission") {
+      const params = req.params;
+      const options = Array.isArray(params?.options) ? params.options : [];
+      const pick = options.find((o) => o?.response?.decision === "allow") ?? options.find((o) => /allow/i.test(`${o?.kind ?? ""} ${o?.optionId ?? ""}`)) ?? options[0];
+      this.log(`Server request: interaction/requestPermission (id=${req.id}) \u2014 options=${options.length} \u2192 granting decision=${pick?.response?.decision ?? "(first)"}`);
+      this.sendRaw({
+        id: req.id,
+        result: pick?.response ?? { decision: "allow" }
+      });
+      return;
+    }
+    if (req.method === "interaction/requestUserInput") {
+      this.log(`Server request: interaction/requestUserInput (id=${req.id}) \u2014 auto-empty`);
+      this.sendRaw({ id: req.id, result: { value: "" } });
+      return;
+    }
+    if (req.method === "interaction/requestProviderRuntimeHeaders") {
+      this.log(`Server request: interaction/requestProviderRuntimeHeaders (id=${req.id}) \u2014 empty`);
+      this.sendRaw({ id: req.id, result: { headers: {} } });
+      return;
+    }
+    this.log(`Server request: ${req.method} (id=${req.id}) \u2014 auto-approving (empty result)`);
+    this.sendRaw({ id: req.id, result: {} });
+  }
+  sendRequest(method, params, timeoutMs) {
+    const id = this.nextRequestId++;
+    const request = { id, method, params };
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pendingRequests.delete(id);
+        reject(new Error(`Request timeout (${timeoutMs}ms): ${method}`));
+      }, timeoutMs);
+      this.pendingRequests.set(id, { resolve, reject, timer });
+      try {
+        this.sendRaw(request);
+      } catch (err) {
+        clearTimeout(timer);
+        this.pendingRequests.delete(id);
+        reject(new Error(`Send failed for ${method}: ${err.message}`));
+      }
+    });
+  }
+  sendNotification(method, params) {
+    this.sendRaw({ method, params });
+  }
+  sendRaw(msg) {
+    if (!this.child?.stdin?.writable) {
+      throw new Error("zcode stdin not writable");
+    }
+    const line = JSON.stringify(msg);
+    this.child.stdin.write(line.endsWith(`
+`) ? line : `${line}
+`);
+  }
+  resolveRequest(id, resp) {
+    const pending = this.pendingRequests.get(id);
+    if (!pending) {
+      this.log(`Unmatched response id=${id}`);
+      return;
+    }
+    clearTimeout(pending.timer);
+    this.pendingRequests.delete(id);
+    pending.resolve(resp);
+  }
+  cleanupPendingRequests(error) {
+    for (const [, pending] of this.pendingRequests) {
+      clearTimeout(pending.timer);
+      pending.reject(error);
+    }
+    this.pendingRequests.clear();
+  }
+  log(msg) {
+    const line = `[${new Date().toISOString()}] [ZcodeAdapter] ${msg}
+`;
+    process.stderr.write(line);
+    try {
+      appendFileSync3(this.logFile, line);
+    } catch {}
+  }
+}
+
+// src/message-filter.ts
+var MARKER_REGEX = /^\s*\[(IMPORTANT|STATUS|FYI)\]\s*/i;
+function parseMarker(content) {
+  const match = content.match(MARKER_REGEX);
+  if (!match)
+    return { marker: "untagged", body: content };
+  return {
+    marker: match[1].toLowerCase(),
+    body: content.slice(match[0].length)
+  };
+}
+function classifyMessage(content, mode) {
+  if (mode === "full")
+    return { action: "forward", marker: "untagged" };
+  const { marker } = parseMarker(content);
+  switch (marker) {
+    case "important":
+      return { action: "forward", marker };
+    case "status":
+      return { action: "buffer", marker };
+    case "fyi":
+      return { action: "drop", marker };
+    case "untagged":
+      return { action: "forward", marker };
+  }
+}
+function buildBridgeContractReminder(controllerName = "Claude", peerName = "Codex") {
+  return `[Bridge Contract] Every message you send is relayed to ${controllerName}. Put exactly ONE marker at the very start of the message:
+- [IMPORTANT] \u2014 your actual answer/result, decisions, reviews, completions, blockers; anything ${controllerName} must see or act on. This is your main channel.
+- [STATUS] \u2014 ONLY notable milestones, used sparingly. Good examples: the spec doesn't match the actual behavior; you found a better approach; a meaningful checkpoint (e.g. a phase finished). If nothing noteworthy happened, send NO [STATUS] at all.
+- [FYI] \u2014 minor background/context ${controllerName} can safely ignore.
+The marker MUST be the first text in the message (e.g. "[IMPORTANT] Task done", not "Task done [IMPORTANT]").
+Do NOT tag routine steps or your step-by-step thinking as [STATUS] \u2014 that floods ${controllerName}. Most intermediate work needs no message at all; just keep working and send ONE [IMPORTANT] result when done.
+Keep agentMessage for high-value communication only.
+
+[Git Operations \u2014 FORBIDDEN]
+You MUST NOT execute any git write commands. This includes but is not limited to:
+git commit, git push, git pull, git fetch, git checkout -b, git branch, git merge, git rebase, git cherry-pick, git tag, git stash.
+These commands write to the .git directory, which is blocked by your sandbox. Attempting them will cause your session to hang indefinitely.
+Read-only git commands (git status, git log, git diff, git show, git rev-parse) are allowed.
+All git write operations must be delegated to ${controllerName} via agentMessage. Report what you changed and let ${controllerName} handle branching, committing, and pushing.
+
+[Role Guidance for ${peerName}]
+- Your default role: Implementer, Executor, Verifier
+- Analytical/review tasks: Independent Analysis & Convergence
+- Implementation tasks: Architect -> Builder -> Critic
+- Debugging tasks: Hypothesis -> Experiment -> Interpretation
+- Do not blindly follow ${controllerName} - challenge with evidence when you disagree
+- Use explicit collaboration phrases: "My independent view is:", "I agree on:", "I disagree on:", "Current consensus:"`;
+}
+function buildReplyRequiredInstruction(controllerName = "Claude") {
+  return `
+
+[\u26A0\uFE0F REPLY REQUIRED] ${controllerName} has explicitly requested a reply. You MUST send an agentMessage with [IMPORTANT] marker containing your response. This is a mandatory requirement \u2014 do not skip or use [STATUS]/[FYI] markers for this reply.`;
+}
+
+class StatusBuffer {
+  onFlush;
+  buffer = [];
+  flushTimer = null;
+  flushThreshold;
+  flushTimeoutMs;
+  paused = false;
+  constructor(onFlush, options) {
+    this.onFlush = onFlush;
+    this.flushThreshold = options?.flushThreshold ?? 3;
+    this.flushTimeoutMs = options?.flushTimeoutMs ?? 15000;
+  }
+  get size() {
+    return this.buffer.length;
+  }
+  pause() {
+    this.paused = true;
+    this.clearTimer();
+  }
+  resume() {
+    this.paused = false;
+    if (this.buffer.length > 0) {
+      this.resetTimer();
+      if (this.buffer.length >= this.flushThreshold) {
+        this.flush("threshold reached after resume");
+      }
+    }
+  }
+  add(message) {
+    this.buffer.push(message);
+    if (this.paused)
+      return;
+    this.resetTimer();
+    if (this.buffer.length >= this.flushThreshold) {
+      this.flush("threshold reached");
+    }
+  }
+  flush(reason) {
+    if (this.buffer.length === 0)
+      return;
+    this.clearTimer();
+    const combined = this.buffer.map((m) => parseMarker(m.content).body).join(`
+---
+`);
+    const summary = {
+      id: `status_summary_${Date.now()}`,
+      source: "codex",
+      content: `[STATUS summary \u2014 ${this.buffer.length} update(s), flushed: ${reason}]
+${combined}`,
+      timestamp: Date.now()
+    };
+    this.onFlush(summary);
+    this.buffer = [];
+  }
+  dispose() {
+    this.clearTimer();
+    this.buffer = [];
+  }
+  clearTimer() {
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
+  }
+  resetTimer() {
+    this.clearTimer();
+    this.flushTimer = setTimeout(() => {
+      this.flushTimer = null;
+      this.flush("timeout");
+    }, this.flushTimeoutMs);
+  }
+}
+
+// src/tui-connection-state.ts
+class TuiConnectionState {
+  options;
+  bridgeReady = false;
+  tuiConnected = false;
+  disconnectNotificationShown = false;
+  disconnectNotificationTimer = null;
+  constructor(options) {
+    this.options = options;
+  }
+  canReply() {
+    if (!this.bridgeReady)
+      return false;
+    return this.tuiConnected || this.disconnectNotificationTimer !== null;
+  }
+  snapshot() {
+    return {
+      bridgeReady: this.bridgeReady,
+      tuiConnected: this.tuiConnected,
+      disconnectNotificationShown: this.disconnectNotificationShown,
+      hasPendingDisconnectNotification: this.disconnectNotificationTimer !== null
+    };
+  }
+  markBridgeReady() {
+    this.bridgeReady = true;
+    this.disconnectNotificationShown = false;
+    this.clearPendingDisconnectNotification("thread became ready");
+  }
+  handleTuiConnected(connId) {
+    const reconnectingAfterNotice = this.disconnectNotificationShown && this.bridgeReady;
+    this.tuiConnected = true;
+    this.clearPendingDisconnectNotification(`TUI reconnected as conn #${connId}`);
+    if (reconnectingAfterNotice) {
+      this.disconnectNotificationShown = false;
+      this.options.onReconnectAfterNotice(connId);
+    }
+  }
+  handleTuiDisconnected(connId) {
+    this.tuiConnected = false;
+    if (!this.bridgeReady) {
+      this.options.log?.(`Suppressing pre-ready TUI disconnect notification (conn #${connId})`);
+      return;
+    }
+    this.scheduleDisconnectNotification(connId);
+  }
+  handleCodexExit() {
+    this.bridgeReady = false;
+    this.tuiConnected = false;
+    this.disconnectNotificationShown = false;
+    this.clearPendingDisconnectNotification("Codex process exited");
+  }
+  dispose(reason = "disposed") {
+    this.clearPendingDisconnectNotification(reason);
+  }
+  clearPendingDisconnectNotification(reason) {
+    if (!this.disconnectNotificationTimer)
+      return;
+    clearTimeout(this.disconnectNotificationTimer);
+    this.disconnectNotificationTimer = null;
+    if (reason) {
+      this.options.log?.(`Cleared pending TUI disconnect notification (${reason})`);
+    }
+  }
+  scheduleDisconnectNotification(connId) {
+    this.clearPendingDisconnectNotification("rescheduled");
+    this.disconnectNotificationTimer = setTimeout(() => {
+      this.disconnectNotificationTimer = null;
+      if (this.tuiConnected) {
+        this.options.log?.(`Skipping TUI disconnect notification for conn #${connId} because TUI already reconnected`);
+        return;
+      }
+      this.disconnectNotificationShown = true;
+      this.options.log?.(`Codex TUI disconnect persisted past grace window (conn #${connId})`);
+      this.options.onDisconnectPersisted(connId);
+    }, this.options.disconnectGraceMs);
+  }
+}
+
+// src/daemon-lifecycle.ts
+import { spawn as spawn4, execFileSync } from "child_process";
+import { existsSync as existsSync2, readFileSync, unlinkSync, writeFileSync, openSync, closeSync, constants } from "fs";
+import { fileURLToPath } from "url";
+function resolveDaemonPath() {
+  const entry = process.env.AGENTBRIDGE_DAEMON_ENTRY ?? "./daemon.ts";
+  return fileURLToPath(new URL(entry, import.meta.url));
+}
+
+class DaemonLifecycle {
+  stateDir;
+  controlPort;
+  log;
+  constructor(opts) {
+    this.stateDir = opts.stateDir;
+    this.controlPort = opts.controlPort;
+    this.log = opts.log;
+  }
+  get healthUrl() {
+    return `http://127.0.0.1:${this.controlPort}/healthz`;
+  }
+  get readyUrl() {
+    return `http://127.0.0.1:${this.controlPort}/readyz`;
+  }
+  get controlWsUrl() {
+    return `ws://127.0.0.1:${this.controlPort}/ws`;
+  }
+  async ensureRunning() {
+    if (await this.isHealthy()) {
+      await this.waitForReady();
+      return;
+    }
+    const existingPid = this.readPid();
+    if (existingPid) {
+      if (isProcessAlive(existingPid)) {
+        if (this.isDaemonProcess(existingPid)) {
+          try {
+            await this.waitForReady(12, 250);
+            return;
+          } catch {
+            throw new Error(`Found existing daemon process ${existingPid}, but control port ${this.controlPort} never became ready.`);
+          }
+        }
+        this.log(`Pid ${existingPid} is alive but not an AgentBridge daemon, removing stale pid file`);
+      }
+      this.removeStalePidFile();
+    }
+    const lockAcquired = this.acquireLock();
+    if (!lockAcquired) {
+      this.log("Another process is starting the daemon, waiting for readiness...");
+      await this.waitForReady();
+      return;
+    }
+    try {
+      this.launch();
+      await this.waitForReady();
+    } finally {
+      this.releaseLock();
+    }
+  }
+  async isHealthy() {
+    try {
+      const response = await fetch(this.healthUrl);
+      return response.ok;
+    } catch {
+      return false;
+    }
+  }
+  async waitForHealthy(maxRetries = 40, delayMs = 250) {
+    for (let attempt = 0;attempt < maxRetries; attempt++) {
+      if (await this.isHealthy())
+        return;
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+    throw new Error(`Timed out waiting for AgentBridge daemon health on ${this.healthUrl}`);
+  }
+  async isReady() {
+    try {
+      const response = await fetch(this.readyUrl);
+      return response.ok;
+    } catch {
+      return false;
+    }
+  }
+  async waitForReady(maxRetries = 40, delayMs = 250) {
+    for (let attempt = 0;attempt < maxRetries; attempt++) {
+      if (await this.isReady())
+        return;
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+    throw new Error(`Timed out waiting for AgentBridge daemon readiness on ${this.readyUrl}`);
+  }
+  readStatus() {
+    try {
+      const raw = readFileSync(this.stateDir.statusFile, "utf-8");
+      return JSON.parse(raw);
+    } catch {
+      return null;
+    }
+  }
+  writeStatus(status) {
+    this.stateDir.ensure();
+    writeFileSync(this.stateDir.statusFile, JSON.stringify(status, null, 2) + `
+`, "utf-8");
+  }
+  readPid() {
+    try {
+      const raw = readFileSync(this.stateDir.pidFile, "utf-8").trim();
+      if (!raw)
+        return null;
+      const pid = Number.parseInt(raw, 10);
+      return Number.isFinite(pid) ? pid : null;
+    } catch {
+      return null;
+    }
+  }
+  writePid(pid) {
+    this.stateDir.ensure();
+    writeFileSync(this.stateDir.pidFile, `${pid ?? process.pid}
+`, "utf-8");
+  }
+  removePidFile() {
+    try {
+      unlinkSync(this.stateDir.pidFile);
+    } catch {}
+  }
+  removeStatusFile() {
+    try {
+      unlinkSync(this.stateDir.statusFile);
+    } catch {}
+  }
+  markKilled() {
+    this.stateDir.ensure();
+    writeFileSync(this.stateDir.killedFile, `${Date.now()}
+`, "utf-8");
+  }
+  clearKilled() {
+    try {
+      unlinkSync(this.stateDir.killedFile);
+    } catch {}
+  }
+  wasKilled() {
+    return existsSync2(this.stateDir.killedFile);
+  }
+  launch() {
+    this.stateDir.ensure();
+    this.log(`Launching detached daemon on control port ${this.controlPort}`);
+    const daemonPath = resolveDaemonPath();
+    const daemonProc = spawn4(process.execPath, ["run", daemonPath], {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        AGENTBRIDGE_CONTROL_PORT: String(this.controlPort),
+        AGENTBRIDGE_STATE_DIR: this.stateDir.dir
+      },
+      detached: true,
+      stdio: "ignore"
+    });
+    daemonProc.unref();
+    daemonProc.on("error", (e) => this.log(`Failed to spawn daemon: ${e.message}`));
+  }
+  removeStalePidFile() {
+    this.log("Removing stale pid file");
+    this.removePidFile();
+  }
+  acquireLock(depth = 0) {
+    if (depth > 1) {
+      this.log("Lock acquisition failed after retry, proceeding without lock");
+      return true;
+    }
+    this.stateDir.ensure();
+    try {
+      const fd = openSync(this.stateDir.lockFile, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY);
+      writeFileSync(fd, `${process.pid}
+`);
+      closeSync(fd);
+      return true;
+    } catch (err) {
+      if (err.code === "EEXIST") {
+        try {
+          const holderPid = Number.parseInt(readFileSync(this.stateDir.lockFile, "utf-8").trim(), 10);
+          if (Number.isFinite(holderPid) && !isProcessAlive(holderPid)) {
+            this.log(`Stale lock file from dead process ${holderPid}, removing`);
+            this.releaseLock();
+            return this.acquireLock(depth + 1);
+          }
+        } catch {
+          this.log("Cannot read lock file, removing stale lock");
+          this.releaseLock();
+          return this.acquireLock(depth + 1);
+        }
+        return false;
+      }
+      this.log(`Warning: could not acquire startup lock: ${err.message}`);
+      return true;
+    }
+  }
+  releaseLock() {
+    try {
+      unlinkSync(this.stateDir.lockFile);
+    } catch {}
+  }
+  async kill(gracefulTimeoutMs = 3000) {
+    const pid = this.readPid();
+    if (!pid) {
+      this.log("No daemon pid file found");
+      this.cleanup();
+      return false;
+    }
+    if (!isProcessAlive(pid)) {
+      this.log(`Daemon pid ${pid} is not alive, cleaning up stale files`);
+      this.cleanup();
+      return false;
+    }
+    if (!this.isDaemonProcess(pid)) {
+      this.log(`Pid ${pid} is alive but is NOT an AgentBridge daemon \u2014 refusing to kill. Cleaning up stale pid file.`);
+      this.cleanup();
+      return false;
+    }
+    this.log(`Sending SIGTERM to daemon pid ${pid}`);
+    try {
+      process.kill(pid, "SIGTERM");
+    } catch {
+      this.cleanup();
+      return false;
+    }
+    const deadline = Date.now() + gracefulTimeoutMs;
+    while (Date.now() < deadline) {
+      if (!isProcessAlive(pid)) {
+        this.log(`Daemon pid ${pid} stopped gracefully`);
+        this.cleanup();
+        return true;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+    this.log(`Daemon pid ${pid} did not stop gracefully, sending SIGKILL`);
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {}
+    this.cleanup();
+    return true;
+  }
+  isDaemonProcess(pid) {
+    try {
+      const cmd = execFileSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf-8" }).trim();
+      return cmd.includes("daemon") && (cmd.includes("agentbridge") || cmd.includes("agent_bridge"));
+    } catch {
+      return false;
+    }
+  }
+  cleanup() {
+    this.removePidFile();
+    this.removeStatusFile();
+    this.releaseLock();
+  }
+}
+function isProcessAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// src/config-service.ts
+import { readFileSync as readFileSync2, writeFileSync as writeFileSync2, mkdirSync as mkdirSync2, existsSync as existsSync3 } from "fs";
+import { join as join3 } from "path";
+var DEFAULT_CONFIG = {
+  version: "1.0",
+  codex: {
+    appPort: 4500,
+    proxyPort: 4501
+  },
+  turnCoordination: {
+    attentionWindowSeconds: 15
+  },
+  idleShutdownSeconds: 30
+};
+var CONFIG_DIR = ".agentbridge";
+var CONFIG_FILE = "config.json";
+function isRecord(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function normalizeInteger(value, fallback) {
+  if (typeof value === "number" && Number.isFinite(value))
+    return value;
+  if (typeof value === "string") {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed))
+      return parsed;
+  }
+  return fallback;
+}
+function normalizeConfig(raw) {
+  if (!isRecord(raw))
+    return null;
+  const config = raw;
+  const codex = isRecord(config.codex) ? config.codex : {};
+  const daemon = isRecord(config.daemon) ? config.daemon : {};
+  const turnCoordination = isRecord(config.turnCoordination) ? config.turnCoordination : {};
+  return {
+    version: typeof config.version === "string" ? config.version : DEFAULT_CONFIG.version,
+    codex: {
+      appPort: normalizeInteger(codex.appPort ?? daemon.port, DEFAULT_CONFIG.codex.appPort),
+      proxyPort: normalizeInteger(codex.proxyPort ?? daemon.proxyPort, DEFAULT_CONFIG.codex.proxyPort)
+    },
+    turnCoordination: {
+      attentionWindowSeconds: normalizeInteger(turnCoordination.attentionWindowSeconds, DEFAULT_CONFIG.turnCoordination.attentionWindowSeconds)
+    },
+    idleShutdownSeconds: normalizeInteger(config.idleShutdownSeconds, DEFAULT_CONFIG.idleShutdownSeconds)
+  };
+}
+
+class ConfigService {
+  configDir;
+  configPath;
+  constructor(projectRoot) {
+    const root = projectRoot ?? process.cwd();
+    this.configDir = join3(root, CONFIG_DIR);
+    this.configPath = join3(this.configDir, CONFIG_FILE);
+  }
+  hasConfig() {
+    return existsSync3(this.configPath);
+  }
+  load() {
+    try {
+      const raw = readFileSync2(this.configPath, "utf-8");
+      return normalizeConfig(JSON.parse(raw));
+    } catch {
+      return null;
+    }
+  }
+  loadOrDefault() {
+    return this.load() ?? structuredClone(DEFAULT_CONFIG);
+  }
+  save(config) {
+    this.ensureConfigDir();
+    writeFileSync2(this.configPath, JSON.stringify(config, null, 2) + `
+`, "utf-8");
+  }
+  initDefaults() {
+    this.ensureConfigDir();
+    const created = [];
+    if (!existsSync3(this.configPath)) {
+      this.save(DEFAULT_CONFIG);
+      created.push(this.configPath);
+    }
+    return created;
+  }
+  get configFilePath() {
+    return this.configPath;
+  }
+  ensureConfigDir() {
+    if (!existsSync3(this.configDir)) {
+      mkdirSync2(this.configDir, { recursive: true });
+    }
+  }
+}
+
+// src/control-protocol.ts
+var CLOSE_CODE_REPLACED = 4001;
+
+// src/controller-injection.ts
+function dedupePeerTurnContent(parts) {
+  const out = [];
+  for (const raw of parts) {
+    const c = raw.trim();
+    if (!c)
+      continue;
+    let merged = false;
+    for (let i = 0;i < out.length; i++) {
+      if (out[i].includes(c)) {
+        merged = true;
+        break;
+      }
+      if (c.includes(out[i])) {
+        out[i] = c;
+        merged = true;
+        break;
+      }
+    }
+    if (!merged)
+      out.push(c);
+  }
+  return out;
+}
+function formatControllerInjection(peerName, parts) {
+  const deduped = dedupePeerTurnContent(parts);
+  if (deduped.length === 0)
+    return null;
+  return `[Message from ${peerName}]
+${deduped.join(`
+
+`)}`;
+}
+function buildControllerKickoff(peer) {
+  return [
+    `\uD83E\uDD1D You are the CONTROLLER in an AgentBridge multi-agent session. ${peer} is your IMPLEMENTER, running headless on this machine.`,
+    "",
+    `## Receiving ${peer} (real-time \u2014 no polling)`,
+    `- ${peer}'s replies are injected directly into THIS conversation as new messages prefixed "[Message from ${peer}]".`,
+    `- You do NOT need to call get_messages \u2014 replies arrive automatically as they happen.`,
+    "",
+    "## Sending",
+    `- Use the \`reply\` tool to send a message to ${peer}; it is injected into ${peer}'s session as a new user turn.`,
+    `- If \`reply\` returns busy, ${peer} is mid-turn \u2014 wait and retry.`,
+    "",
+    "## Your role",
+    `- Plan and decompose the task; delegate concrete implementation/testing to ${peer}; review its output before moving on.`,
+    `- Include [SESSION_RESET] in a reply at phase boundaries to reset ${peer}'s context (always include a progress summary).`
+  ].join(`
+`);
+}
+
+// src/daemon.ts
+var AGENTBRIDGE_PEER = (process.env.AGENTBRIDGE_PEER ?? "codex").toLowerCase();
+var stateDir = new StateDirResolver;
+stateDir.ensure();
+var configService = new ConfigService;
+var config = configService.loadOrDefault();
+var CODEX_APP_PORT = parseInt(process.env.CODEX_WS_PORT ?? String(config.codex.appPort), 10);
+var CODEX_PROXY_PORT = parseInt(process.env.CODEX_PROXY_PORT ?? String(config.codex.proxyPort), 10);
+var CONTROL_PORT = parseInt(process.env.AGENTBRIDGE_CONTROL_PORT ?? "4502", 10);
+var TUI_DISCONNECT_GRACE_MS = parseInt(process.env.TUI_DISCONNECT_GRACE_MS ?? "2500", 10);
+var CLAUDE_DISCONNECT_GRACE_MS = 5000;
+var MAX_BUFFERED_MESSAGES = parseInt(process.env.AGENTBRIDGE_MAX_BUFFERED_MESSAGES ?? "100", 10);
+var FILTER_MODE = process.env.AGENTBRIDGE_FILTER_MODE === "full" ? "full" : "filtered";
+var IDLE_SHUTDOWN_MS = parseInt(process.env.AGENTBRIDGE_IDLE_SHUTDOWN_MS ?? String(config.idleShutdownSeconds * 1000), 10);
+var ATTENTION_WINDOW_MS = parseInt(process.env.AGENTBRIDGE_ATTENTION_WINDOW_MS ?? String(config.turnCoordination.attentionWindowSeconds * 1000), 10);
+var daemonLifecycle = new DaemonLifecycle({ stateDir, controlPort: CONTROL_PORT, log });
+var codex = AGENTBRIDGE_PEER === "kimi" ? new KimiAdapter(stateDir.logFile) : AGENTBRIDGE_PEER === "zcode" ? new ZcodeAdapter(stateDir.logFile) : new CodexAdapter(CODEX_APP_PORT, CODEX_PROXY_PORT, stateDir.logFile, [], process.env.AGENTBRIDGE_WORK_DIR);
+var peerName = AGENTBRIDGE_PEER === "kimi" ? "Kimi" : AGENTBRIDGE_PEER === "zcode" ? "ZCode" : "Codex";
+var attachCmd = AGENTBRIDGE_PEER === "kimi" ? "(kimi acp \u2014 managed by daemon directly)" : AGENTBRIDGE_PEER === "zcode" ? "(zcode app-server --stdio \u2014 managed by daemon directly)" : `codex --enable tui_app_server --remote ${codex.proxyUrl}`;
+var CONTROLLER_IS_CODEX = (process.env.AGENTBRIDGE_CONTROLLER ?? "").toLowerCase() === "codex";
+var controllerName = CONTROLLER_IS_CODEX ? "Codex" : "Claude";
+var bridgeContractReminder = buildBridgeContractReminder(controllerName, peerName);
+var replyRequiredInstruction = buildReplyRequiredInstruction(controllerName);
+var CONTROLLER_APP_PORT = parseInt(process.env.AGENTBRIDGE_CONTROLLER_APP_PORT ?? "4720", 10);
+var CONTROLLER_PROXY_PORT = parseInt(process.env.AGENTBRIDGE_CONTROLLER_PROXY_PORT ?? "4721", 10);
+function buildControllerMcpArgs() {
+  const bridgeScript = process.env.AGENTBRIDGE_BRIDGE_SCRIPT;
+  if (!bridgeScript) {
+    log("AGENTBRIDGE_BRIDGE_SCRIPT not set \u2014 controller Codex will have no reply tool");
+    return [];
+  }
+  return [
+    "-c",
+    `mcp_servers.agentbridge.command="bun"`,
+    "-c",
+    `mcp_servers.agentbridge.args=["run","${bridgeScript}"]`,
+    "-c",
+    `mcp_servers.agentbridge.startup_timeout_sec=15`,
+    "-c",
+    `mcp_servers.agentbridge.env.AGENTBRIDGE_PEER="${AGENTBRIDGE_PEER}"`,
+    "-c",
+    `mcp_servers.agentbridge.env.AGENTBRIDGE_CONTROL_PORT="${CONTROL_PORT}"`,
+    "-c",
+    `mcp_servers.agentbridge.env.AGENTBRIDGE_STATE_DIR="${process.env.AGENTBRIDGE_STATE_DIR ?? ""}"`,
+    "-c",
+    `mcp_servers.agentbridge.env.AGENTBRIDGE_DAEMON_ENTRY="${process.env.AGENTBRIDGE_DAEMON_ENTRY ?? ""}"`,
+    "-c",
+    `mcp_servers.agentbridge.env.AGENTBRIDGE_RESTART_CMD="${process.env.AGENTBRIDGE_RESTART_CMD ?? ""}"`
+  ];
+}
+var controller = CONTROLLER_IS_CODEX ? new CodexAdapter(CONTROLLER_APP_PORT, CONTROLLER_PROXY_PORT, stateDir.logFile, buildControllerMcpArgs(), process.env.AGENTBRIDGE_WORK_DIR) : null;
+var controllerTurnBuffer = [];
+var controllerInjectQueue = [];
+var controllerThreadReady = false;
+var controllerKickoffSent = false;
+var controllerFlushInFlight = false;
+var controllerFlushPending = false;
+var controlServer = null;
+var attachedClaude = null;
+var nextControlClientId = 0;
+var nextSystemMessageId = 0;
+var codexBootstrapped = false;
+var attentionWindowTimer = null;
+var inAttentionWindow = false;
+var replyRequired = false;
+var replyReceivedDuringTurn = false;
+var shuttingDown = false;
+var idleShutdownTimer = null;
+var claudeDisconnectTimer = null;
+var claudeOnlineNoticeSent = false;
+var claudeOfflineNoticeShown = false;
+var codexCollaborationKickoffSent = false;
+var lastAttachStatusSentTs = 0;
+var ATTACH_STATUS_COOLDOWN_MS = 30000;
+var bufferedMessages = [];
+var tuiConnectionState = new TuiConnectionState({
+  disconnectGraceMs: TUI_DISCONNECT_GRACE_MS,
+  log,
+  onDisconnectPersisted: (connId) => {
+    emitToClaude(systemMessage("system_tui_disconnected", `\u26A0\uFE0F ${peerName} TUI disconnected (conn #${connId}). ${peerName} is still running in the background \u2014 reconnect the TUI to resume.`));
+  },
+  onReconnectAfterNotice: (connId) => {
+    emitToClaude(systemMessage("system_tui_reconnected", `\u2705 ${peerName} TUI reconnected (conn #${connId}). Bridge restored, communication can continue.`));
+    codex.injectMessage(`\u2705 ${controllerName} is still online, bridge restored. Bidirectional communication can continue.`);
+  }
+});
+var statusBuffer = new StatusBuffer((summary) => forwardPeerContent(summary));
+codex.on("turnStarted", () => {
+  log(`${peerName} turn started`);
+  emitToClaude(systemMessage("system_turn_started", `\u23F3 ${peerName} is working on the current task. Wait for completion before sending a reply.`));
+});
+codex.on("agentMessage", (msg) => {
+  if (msg.source !== "codex")
+    return;
+  const result = classifyMessage(msg.content, FILTER_MODE);
+  if (replyRequired) {
+    log(`${peerName} \u2192 Claude [${result.marker}/force-forward-reply-required] (${msg.content.length} chars)`);
+    replyReceivedDuringTurn = true;
+    if (statusBuffer.size > 0) {
+      statusBuffer.flush("reply-required message arrived");
+    }
+    forwardPeerContent(msg);
+    return;
+  }
+  if (inAttentionWindow && result.marker === "status") {
+    log(`${peerName} \u2192 Claude [${result.marker}/buffer-attention] (${msg.content.length} chars)`);
+    statusBuffer.add(msg);
+    return;
+  }
+  log(`${peerName} \u2192 Claude [${result.marker}/${result.action}] (${msg.content.length} chars)`);
+  switch (result.action) {
+    case "forward":
+      if (result.marker === "important" && statusBuffer.size > 0) {
+        statusBuffer.flush("important message arrived");
+      }
+      forwardPeerContent(msg);
+      if (result.marker === "important") {
+        startAttentionWindow();
+      }
+      break;
+    case "buffer":
+      statusBuffer.add(msg);
+      break;
+    case "drop":
+      break;
+  }
+});
+codex.on("turnCompleted", () => {
+  log(`${peerName} turn completed`);
+  statusBuffer.flush("turn completed");
+  flushControllerTurnBuffer();
+  if (replyRequired && !replyReceivedDuringTurn) {
+    log(`\u26A0\uFE0F Reply was required but ${peerName} did not send any agentMessage`);
+    emitToClaude(systemMessage("system_reply_missing", `\u26A0\uFE0F ${peerName} completed the turn without sending a reply (require_reply was set). ${peerName} may not have generated an agentMessage. You may want to retry or rephrase.`));
+  }
+  replyRequired = false;
+  replyReceivedDuringTurn = false;
+  emitToClaude(systemMessage("system_turn_completed", `\u2705 ${peerName} finished the current turn. You can reply now if needed.`));
+  startAttentionWindow();
+  if (attachedClaude && shouldNotifyCodexClaudeOnline()) {
+    notifyCodexClaudeOnline();
+  }
+});
+codex.on("ready", (threadId) => {
+  tuiConnectionState.markBridgeReady();
+  log(`${peerName} ready \u2014 thread ${threadId}`);
+  log("Bridge fully operational");
+  emitToClaude(systemMessage("system_ready", currentReadyMessage()));
+  if (attachedClaude && shouldNotifyCodexClaudeOnline()) {
+    notifyCodexClaudeOnline();
+  }
+});
+codex.on("tuiConnected", (connId) => {
+  tuiConnectionState.handleTuiConnected(connId);
+  cancelIdleShutdown();
+  log(`${peerName} TUI connected (conn #${connId})`);
+  broadcastStatus();
+});
+codex.on("tuiDisconnected", (connId) => {
+  tuiConnectionState.handleTuiDisconnected(connId);
+  log(`${peerName} TUI disconnected (conn #${connId})`);
+  broadcastStatus();
+  scheduleIdleShutdown();
+});
+codex.on("error", (err) => {
+  log(`${peerName} error: ${err.message}`);
+});
+codex.on("exit", (code) => {
+  log(`${peerName} process exited (code ${code})`);
+  codexBootstrapped = false;
+  statusBuffer.flush("codex exited");
+  tuiConnectionState.handleCodexExit();
+  clearPendingClaudeDisconnect(`${peerName} process exited`);
+  claudeOnlineNoticeSent = false;
+  claudeOfflineNoticeShown = false;
+  emitToClaude(systemMessage("system_codex_exit", `\u26A0\uFE0F ${peerName} app-server exited (code ${code ?? "unknown"}). AgentBridge daemon is still running, but the ${peerName} side needs to be restarted.`));
+  broadcastStatus();
+});
+function forwardPeerContent(msg) {
+  if (controller) {
+    controllerTurnBuffer.push(msg.content);
+  } else {
+    emitToClaude(msg);
+  }
+}
+function flushControllerTurnBuffer() {
+  if (!controller || controllerTurnBuffer.length === 0)
+    return;
+  const injection = formatControllerInjection(peerName, controllerTurnBuffer);
+  controllerTurnBuffer.length = 0;
+  if (injection) {
+    controllerInjectQueue.push(injection);
+    flushControllerQueue();
+  }
+}
+async function flushControllerQueue() {
+  if (!controller || !controllerThreadReady)
+    return;
+  if (controllerFlushInFlight) {
+    controllerFlushPending = true;
+    return;
+  }
+  controllerFlushInFlight = true;
+  try {
+    do {
+      controllerFlushPending = false;
+      while (controllerInjectQueue.length > 0) {
+        const text = controllerInjectQueue[0];
+        if (controller.turnInProgress) {
+          const steered = await controller.steerMessage(text);
+          if (!steered)
+            break;
+          controllerInjectQueue.shift();
+        } else {
+          if (!controller.injectMessage(text))
+            break;
+          controllerInjectQueue.shift();
+        }
+      }
+    } while (controllerFlushPending);
+  } finally {
+    controllerFlushInFlight = false;
+  }
+}
+if (controller) {
+  controller.on("ready", (threadId) => {
+    controllerThreadReady = true;
+    cancelIdleShutdown();
+    log(`Controller Codex ready \u2014 thread ${threadId}`);
+    if (!controllerKickoffSent) {
+      controllerKickoffSent = true;
+      controllerInjectQueue.unshift(buildControllerKickoff(peerName));
+    }
+    flushControllerQueue();
+  });
+  controller.on("turnCompleted", () => {
+    flushControllerQueue();
+  });
+  controller.on("tuiConnected", (connId) => {
+    cancelIdleShutdown();
+    log(`Controller Codex TUI connected (conn #${connId})`);
+    broadcastStatus();
+  });
+  controller.on("tuiDisconnected", (connId) => {
+    log(`Controller Codex TUI disconnected (conn #${connId})`);
+    scheduleIdleShutdown();
+    broadcastStatus();
+  });
+  controller.on("error", (err) => {
+    log(`Controller Codex error: ${err.message}`);
+  });
+  controller.on("exit", (code) => {
+    controllerThreadReady = false;
+    log(`Controller Codex app-server exited (code ${code ?? "unknown"})`);
+  });
+}
+function startControlServer() {
+  controlServer = Bun.serve({
+    port: CONTROL_PORT,
+    hostname: "127.0.0.1",
+    fetch(req, server) {
+      const url = new URL(req.url);
+      if (url.pathname === "/healthz") {
+        return Response.json(currentStatus());
+      }
+      if (url.pathname === "/readyz") {
+        return Response.json(currentStatus(), { status: codexBootstrapped ? 200 : 503 });
+      }
+      if (url.pathname === "/ws" && server.upgrade(req, { data: { clientId: 0, attached: false } })) {
+        return;
+      }
+      return new Response("AgentBridge daemon");
+    },
+    websocket: {
+      idleTimeout: 960,
+      sendPings: true,
+      open: (ws) => {
+        ws.data.clientId = ++nextControlClientId;
+        log(`Frontend socket opened (#${ws.data.clientId})`);
+      },
+      close: (ws, code, reason) => {
+        log(`Frontend socket closed (#${ws.data.clientId}, code=${code}, reason=${reason || "none"}, wasAttached=${attachedClaude === ws})`);
+        if (attachedClaude === ws) {
+          detachClaude(ws, "frontend socket closed");
+        }
+      },
+      message: (ws, raw) => {
+        handleControlMessage(ws, raw);
+      }
+    }
+  });
+}
+async function handleControlMessage(ws, raw) {
+  let message;
+  try {
+    const text = typeof raw === "string" ? raw : raw.toString();
+    message = JSON.parse(text);
+  } catch (e) {
+    log(`Failed to parse control message: ${e.message}`);
+    return;
+  }
+  switch (message.type) {
+    case "claude_connect":
+      attachClaude(ws);
+      return;
+    case "claude_disconnect":
+      detachClaude(ws, "frontend requested disconnect");
+      return;
+    case "status":
+      sendStatus(ws);
+      return;
+    case "claude_to_codex": {
+      if (message.message.source !== "claude") {
+        sendProtocolMessage(ws, {
+          type: "claude_to_codex_result",
+          requestId: message.requestId,
+          success: false,
+          error: "Invalid message source"
+        });
+        return;
+      }
+      if (!tuiConnectionState.canReply()) {
+        sendProtocolMessage(ws, {
+          type: "claude_to_codex_result",
+          requestId: message.requestId,
+          success: false,
+          error: `${peerName} is not ready. Wait for the session to be established.`
+        });
+        return;
+      }
+      const requireReply = !!message.requireReply;
+      let content = message.message.content;
+      if (content.includes("[SESSION_RESET]")) {
+        log(`Session reset requested by Claude`);
+        content = content.replace(/\[SESSION_RESET\]\s*/g, "").trim();
+        if ((AGENTBRIDGE_PEER === "kimi" || AGENTBRIDGE_PEER === "zcode") && typeof codex.resetSession === "function") {
+          emitToClaude(systemMessage("system_session_resetting", `\uD83D\uDD04 Resetting ${peerName} session \u2014 killing old process, starting fresh with clean context...`));
+          try {
+            await codex.resetSession();
+            emitToClaude(systemMessage("system_session_reset", `\u2705 ${peerName} session reset complete. New session: ${codex.activeThreadId}. Previous context is cleared.`));
+            log(`Session reset complete \u2014 new sessionId=${codex.activeThreadId}`);
+          } catch (err) {
+            log(`Session reset failed: ${err.message}`);
+            emitToClaude(systemMessage("system_session_reset_failed", `\u274C ${peerName} session reset failed: ${err.message}. Continuing with existing session.`));
+          }
+        } else {
+          emitToClaude(systemMessage("system_session_reset_unsupported", `\u26A0\uFE0F Session reset is only supported in Kimi/ZCode mode (AGENTBRIDGE_PEER=kimi|zcode). Ignoring [SESSION_RESET].`));
+        }
+        if (!content) {
+          sendProtocolMessage(ws, {
+            type: "claude_to_codex_result",
+            requestId: message.requestId,
+            success: true
+          });
+          return;
+        }
+      }
+      let contentWithReminder = content + `
+
+` + bridgeContractReminder;
+      if (requireReply) {
+        contentWithReminder += replyRequiredInstruction;
+        replyRequired = true;
+        replyReceivedDuringTurn = false;
+        log(`Reply required flag set for this message`);
+      }
+      log(`Forwarding Claude \u2192 ${peerName} (${content.length} chars, requireReply=${requireReply})`);
+      const injected = codex.injectMessage(contentWithReminder);
+      if (!injected) {
+        const reason = codex.turnInProgress ? `${peerName} is busy executing a turn. Wait for it to finish before sending another message.` : "Injection failed: no active thread or WebSocket not connected.";
+        log(`Injection rejected: ${reason}`);
+        sendProtocolMessage(ws, {
+          type: "claude_to_codex_result",
+          requestId: message.requestId,
+          success: false,
+          error: reason
+        });
+        return;
+      }
+      clearAttentionWindow();
+      sendProtocolMessage(ws, {
+        type: "claude_to_codex_result",
+        requestId: message.requestId,
+        success: true
+      });
+      return;
+    }
+  }
+}
+function attachClaude(ws) {
+  if (attachedClaude && attachedClaude !== ws && attachedClaude.readyState !== WebSocket.CLOSED) {
+    log(`Replacing controller #${attachedClaude.data.clientId} with #${ws.data.clientId} (readyState=${attachedClaude.readyState})`);
+    try {
+      sendBridgeMessage(attachedClaude, systemMessage("system_controller_replaced", "\u2194\uFE0F Another controller session (CLI or App) just connected. This side is now standby \u2014 it will reconnect automatically when the other side disconnects."));
+    } catch {}
+    try {
+      attachedClaude.close(CLOSE_CODE_REPLACED, "replaced by a newer controller session");
+    } catch {}
+    attachedClaude = null;
+  }
+  clearPendingClaudeDisconnect("Claude frontend attached");
+  attachedClaude = ws;
+  ws.data.attached = true;
+  cancelIdleShutdown();
+  log(`Claude frontend attached (#${ws.data.clientId})`);
+  statusBuffer.flush("claude reconnected");
+  sendStatus(ws);
+  const now = Date.now();
+  const isRapidReattach = now - lastAttachStatusSentTs < ATTACH_STATUS_COOLDOWN_MS;
+  if (bufferedMessages.length > 0) {
+    flushBufferedMessages(ws);
+  } else if (!isRapidReattach) {
+    if (tuiConnectionState.canReply()) {
+      sendBridgeMessage(ws, systemMessage("system_ready", currentReadyMessage()));
+    } else if (codexBootstrapped) {
+      sendBridgeMessage(ws, systemMessage("system_waiting", currentWaitingMessage()));
+    }
+  }
+  lastAttachStatusSentTs = now;
+  if (tuiConnectionState.canReply() && shouldNotifyCodexClaudeOnline()) {
+    notifyCodexClaudeOnline();
+  }
+}
+function detachClaude(ws, reason) {
+  if (attachedClaude !== ws)
+    return;
+  attachedClaude = null;
+  ws.data.attached = false;
+  log(`Claude frontend detached (#${ws.data.clientId}, ${reason})`);
+  scheduleClaudeDisconnectNotification(ws.data.clientId);
+  scheduleIdleShutdown();
+}
+function startAttentionWindow() {
+  clearAttentionWindow();
+  inAttentionWindow = true;
+  statusBuffer.pause();
+  log(`Attention window started (${ATTENTION_WINDOW_MS}ms)`);
+  attentionWindowTimer = setTimeout(() => {
+    attentionWindowTimer = null;
+    inAttentionWindow = false;
+    statusBuffer.resume();
+    log("Attention window ended");
+  }, ATTENTION_WINDOW_MS);
+}
+function clearAttentionWindow() {
+  if (attentionWindowTimer) {
+    clearTimeout(attentionWindowTimer);
+    attentionWindowTimer = null;
+  }
+  if (inAttentionWindow) {
+    statusBuffer.resume();
+  }
+  inAttentionWindow = false;
+}
+function scheduleIdleShutdown() {
+  cancelIdleShutdown();
+  if (attachedClaude)
+    return;
+  const snapshot = tuiConnectionState.snapshot();
+  if (snapshot.tuiConnected)
+    return;
+  log(`No clients connected. Daemon will shut down in ${IDLE_SHUTDOWN_MS}ms if no one reconnects.`);
+  idleShutdownTimer = setTimeout(() => {
+    if (attachedClaude || tuiConnectionState.snapshot().tuiConnected) {
+      log("Idle shutdown cancelled: client reconnected during grace period");
+      return;
+    }
+    shutdown("idle \u2014 no clients connected");
+  }, IDLE_SHUTDOWN_MS);
+}
+function cancelIdleShutdown() {
+  if (idleShutdownTimer) {
+    clearTimeout(idleShutdownTimer);
+    idleShutdownTimer = null;
+  }
+}
+function clearPendingClaudeDisconnect(reason) {
+  if (!claudeDisconnectTimer)
+    return;
+  clearTimeout(claudeDisconnectTimer);
+  claudeDisconnectTimer = null;
+  if (reason) {
+    log(`Cleared pending Claude disconnect notification (${reason})`);
+  }
+}
+function scheduleClaudeDisconnectNotification(clientId) {
+  clearPendingClaudeDisconnect("rescheduled");
+  claudeDisconnectTimer = setTimeout(() => {
+    claudeDisconnectTimer = null;
+    if (attachedClaude) {
+      log(`Skipping Claude disconnect notification for client #${clientId} because Claude already reconnected`);
+      return;
+    }
+    if (!tuiConnectionState.canReply()) {
+      log(`Suppressing Claude disconnect notification for client #${clientId} because ${peerName} cannot reply`);
+      return;
+    }
+    if (!claudeOnlineNoticeSent) {
+      log(`Suppressing Claude disconnect notification for client #${clientId} because Claude was never announced online`);
+      return;
+    }
+    codex.injectMessage(`\u26A0\uFE0F ${controllerName} went offline. AgentBridge is still running in the background; it will reconnect automatically when ${controllerName} reopens.`);
+    claudeOnlineNoticeSent = false;
+    claudeOfflineNoticeShown = true;
+    log(`Claude disconnect persisted past grace window (client #${clientId})`);
+  }, CLAUDE_DISCONNECT_GRACE_MS);
+}
+function emitToClaude(message) {
+  if (attachedClaude && attachedClaude.readyState === WebSocket.OPEN) {
+    if (trySendBridgeMessage(attachedClaude, message))
+      return;
+    log("Send to Claude failed, buffering message for retry on reconnect");
+  }
+  bufferedMessages.push(message);
+  if (bufferedMessages.length > MAX_BUFFERED_MESSAGES) {
+    const dropped = bufferedMessages.length - MAX_BUFFERED_MESSAGES;
+    bufferedMessages.splice(0, dropped);
+    log(`Message buffer overflow: dropped ${dropped} oldest message(s), ${MAX_BUFFERED_MESSAGES} remaining`);
+  }
+}
+function trySendBridgeMessage(ws, message) {
+  try {
+    const result = ws.send(JSON.stringify({ type: "codex_to_claude", message }));
+    if (typeof result === "number" && result <= 0) {
+      log(`Bridge message send returned ${result} (0=dropped, -1=backpressure)`);
+      return false;
+    }
+    return true;
+  } catch (err) {
+    log(`Failed to send bridge message: ${err.message}`);
+    return false;
+  }
+}
+function flushBufferedMessages(ws) {
+  const messages = bufferedMessages.splice(0, bufferedMessages.length);
+  for (const message of messages) {
+    if (!trySendBridgeMessage(ws, message)) {
+      const failedIndex = messages.indexOf(message);
+      const remaining = messages.slice(failedIndex);
+      bufferedMessages.unshift(...remaining);
+      log(`Flush interrupted: re-buffered ${remaining.length} message(s) after send failure`);
+      return;
+    }
+  }
+}
+function sendBridgeMessage(ws, message) {
+  trySendBridgeMessage(ws, message);
+}
+function sendStatus(ws) {
+  sendProtocolMessage(ws, { type: "status", status: currentStatus() });
+}
+function broadcastStatus() {
+  if (!attachedClaude)
+    return;
+  sendStatus(attachedClaude);
+}
+function sendProtocolMessage(ws, message) {
+  try {
+    ws.send(JSON.stringify(message));
+  } catch (err) {
+    log(`Failed to send control message: ${err.message}`);
+  }
+}
+function currentStatus() {
+  const snapshot = tuiConnectionState.snapshot();
+  return {
+    bridgeReady: tuiConnectionState.canReply(),
+    tuiConnected: snapshot.tuiConnected,
+    controllerConnected: !!attachedClaude,
+    threadId: codex.activeThreadId,
+    queuedMessageCount: bufferedMessages.length + statusBuffer.size,
+    proxyUrl: codex.proxyUrl,
+    appServerUrl: codex.appServerUrl,
+    controllerProxyUrl: controller?.proxyUrl,
+    pid: process.pid
+  };
+}
+function currentWaitingMessage() {
+  return `\u23F3 Waiting for ${peerName} to connect. Run in another terminal:
+${attachCmd}`;
+}
+function currentReadyMessage() {
+  return `\u2705 ${peerName} connected (${codex.activeThreadId}). Bridge ready.`;
+}
+function notifyCodexClaudeOnline() {
+  const message = !codexCollaborationKickoffSent ? [
+    `\uD83E\uDD1D ${controllerName} has connected via AgentBridge.`,
+    "You are now in a multi-agent collaboration session.",
+    `When you receive a complex task, propose a division of labor to ${controllerName}.`,
+    `${controllerName} can send you messages \u2014 they will appear as injected user messages.`,
+    `Respond naturally and ${controllerName} will receive your output via AgentBridge.`
+  ].join(`
+`) : `\u2705 AgentBridge connected to ${controllerName}.`;
+  const delivered = codex.injectMessage(message);
+  if (!delivered) {
+    log(`Deferred Claude-online notice to ${peerName} \u2014 will retry after current turn completes`);
+    return false;
+  }
+  claudeOnlineNoticeSent = true;
+  claudeOfflineNoticeShown = false;
+  codexCollaborationKickoffSent = true;
+  return true;
+}
+function shouldNotifyCodexClaudeOnline() {
+  return !claudeOnlineNoticeSent || claudeOfflineNoticeShown;
+}
+function systemMessage(idPrefix, content) {
+  return {
+    id: `${idPrefix}_${++nextSystemMessageId}`,
+    source: "codex",
+    content,
+    timestamp: Date.now()
+  };
+}
+function writePidFile() {
+  daemonLifecycle.writePid();
+}
+function removePidFile() {
+  daemonLifecycle.removePidFile();
+}
+function writeStatusFile() {
+  daemonLifecycle.writeStatus({
+    proxyUrl: codex.proxyUrl,
+    appServerUrl: codex.appServerUrl,
+    controllerProxyUrl: controller?.proxyUrl,
+    controlPort: CONTROL_PORT,
+    pid: process.pid
+  });
+}
+function removeStatusFile() {
+  daemonLifecycle.removeStatusFile();
+}
+async function bootCodex() {
+  log("Starting AgentBridge daemon...");
+  log(`${peerName} app-server: ${codex.appServerUrl}`);
+  log(`${peerName} proxy: ${codex.proxyUrl}`);
+  log(`Control server: ws://127.0.0.1:${CONTROL_PORT}/ws`);
+  try {
+    await codex.start();
+    codexBootstrapped = true;
+    if (controller) {
+      try {
+        await controller.start();
+        log(`Controller Codex middleman proxy: ${controller.proxyUrl}`);
+      } catch (err) {
+        log(`Failed to start controller Codex middleman: ${err.message}`);
+        emitToClaude(systemMessage("system_controller_start_failed", `\u274C AgentBridge failed to start the controller Codex middleman: ${err.message}`));
+      }
+    }
+    writeStatusFile();
+    emitToClaude(systemMessage("system_waiting", currentWaitingMessage()));
+    broadcastStatus();
+  } catch (err) {
+    log(`Failed to start ${peerName}: ${err.message}`);
+    emitToClaude(systemMessage("system_codex_start_failed", `\u274C AgentBridge failed to start ${peerName} app-server: ${err.message}`));
+    broadcastStatus();
+  }
+}
+function shutdown(reason) {
+  if (shuttingDown)
+    return;
+  shuttingDown = true;
+  log(`Shutting down daemon (${reason})...`);
+  tuiConnectionState.dispose(`daemon shutdown (${reason})`);
+  clearPendingClaudeDisconnect(`daemon shutdown (${reason})`);
+  controlServer?.stop();
+  controlServer = null;
+  codex.stop();
+  controller?.stop();
+  removePidFile();
+  removeStatusFile();
+  process.exit(0);
+}
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("exit", () => {
+  removePidFile();
+  removeStatusFile();
+});
+process.on("uncaughtException", (err) => {
+  log(`UNCAUGHT EXCEPTION: ${err.stack ?? err.message}`);
+});
+process.on("unhandledRejection", (reason) => {
+  log(`UNHANDLED REJECTION: ${reason?.stack ?? reason}`);
+});
+function log(msg) {
+  const line = `[${new Date().toISOString()}] [AgentBridgeDaemon] ${msg}
+`;
+  process.stderr.write(line);
+  try {
+    appendFileSync4(stateDir.logFile, line);
+  } catch {}
+}
+if (daemonLifecycle.wasKilled()) {
+  log("Killed sentinel found \u2014 daemon was intentionally stopped. Exiting immediately.");
+  process.exit(0);
+}
+writePidFile();
+startControlServer();
+bootCodex();
