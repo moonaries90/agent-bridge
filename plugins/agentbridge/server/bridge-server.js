@@ -14566,6 +14566,8 @@ var configService = new ConfigService;
 var config2 = configService.loadOrDefault();
 var CONTROL_PORT = parseInt(process.env.AGENTBRIDGE_CONTROL_PORT ?? "4502", 10);
 var daemonLifecycle = new DaemonLifecycle({ stateDir, controlPort: CONTROL_PORT, log });
+var peerName = resolvePeerName();
+var peerIsAutoSpawned = (process.env.AGENTBRIDGE_PEER ?? "codex").toLowerCase() !== "codex";
 var CONTROL_WS_URL = daemonLifecycle.controlWsUrl;
 var claude = new ClaudeAdapter(stateDir.logFile);
 var daemonClient = new DaemonClient(CONTROL_WS_URL);
@@ -14602,9 +14604,9 @@ daemonClient.on("status", (status) => {
     hasSeenTuiConnect = true;
     log("First TUI connect detected \u2014 sending kickoff message to Claude");
     claude.pushNotification(systemMessage("system_tui_kickoff", [
-      "\uD83E\uDD1D Codex has connected via AgentBridge.",
+      `\uD83E\uDD1D ${peerName} has connected via AgentBridge.`,
       "You are now in a multi-agent collaboration session.",
-      "When you receive a complex task, propose a division of labor to Codex.",
+      `When you receive a complex task, propose a division of labor to ${peerName}.`,
       "Use `reply` to send messages and `get_messages` to check for responses."
     ].join(`
 `)));
@@ -14652,7 +14654,8 @@ async function connectToDaemon(isReconnect = false) {
     daemonClient.attachClaude();
     daemonDisabledReason = null;
     if (!isReconnect) {
-      claude.pushNotification(systemMessage("system_bridge_ready", "\u2705 AgentBridge bridge is ready. Daemon connected. Start Codex in another terminal with: agentbridge codex"));
+      const readyHint = peerIsAutoSpawned ? `${peerName} is managed by the daemon and will connect automatically.` : `Start ${peerName} in another terminal with: agentbridge codex`;
+      claude.pushNotification(systemMessage("system_bridge_ready", `\u2705 AgentBridge bridge is ready. Daemon connected. ${readyHint}`));
     }
   } catch (err) {
     log(`Failed to connect to daemon: ${err.message}`);

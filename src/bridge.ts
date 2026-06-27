@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 
 import { appendFileSync } from "node:fs";
-import { ClaudeAdapter } from "./claude-adapter";
+import { ClaudeAdapter, resolvePeerName } from "./claude-adapter";
 import { DaemonClient } from "./daemon-client";
 import { DaemonLifecycle } from "./daemon-lifecycle";
 import { StateDirResolver } from "./state-dir";
@@ -16,6 +16,14 @@ const config = configService.loadOrDefault();
 
 const CONTROL_PORT = parseInt(process.env.AGENTBRIDGE_CONTROL_PORT ?? "4502", 10);
 const daemonLifecycle = new DaemonLifecycle({ stateDir, controlPort: CONTROL_PORT, log });
+
+// Peer display name (Codex/Kimi/ZCode), resolved from AGENTBRIDGE_PEER — same
+// var the daemon and ClaudeAdapter read. Used in user-facing kickoff/ready
+// notices so they name the actual peer instead of hardcoding "Codex".
+const peerName = resolvePeerName();
+// Codex requires the user to attach its TUI in a second terminal; Kimi/ZCode are
+// headless and spawned by the daemon automatically (no manual step).
+const peerIsAutoSpawned = (process.env.AGENTBRIDGE_PEER ?? "codex").toLowerCase() !== "codex";
 const CONTROL_WS_URL = daemonLifecycle.controlWsUrl;
 
 const claude = new ClaudeAdapter(stateDir.logFile);
@@ -69,9 +77,9 @@ daemonClient.on("status", (status) => {
     void claude.pushNotification(systemMessage(
       "system_tui_kickoff",
       [
-        "🤝 Codex has connected via AgentBridge.",
+        `🤝 ${peerName} has connected via AgentBridge.`,
         "You are now in a multi-agent collaboration session.",
-        "When you receive a complex task, propose a division of labor to Codex.",
+        `When you receive a complex task, propose a division of labor to ${peerName}.`,
         "Use `reply` to send messages and `get_messages` to check for responses.",
       ].join("\n"),
     ));
@@ -138,9 +146,12 @@ async function connectToDaemon(isReconnect = false) {
     daemonClient.attachClaude();
     daemonDisabledReason = null;
     if (!isReconnect) {
+      const readyHint = peerIsAutoSpawned
+        ? `${peerName} is managed by the daemon and will connect automatically.`
+        : `Start ${peerName} in another terminal with: agentbridge codex`;
       void claude.pushNotification(systemMessage(
         "system_bridge_ready",
-        "✅ AgentBridge bridge is ready. Daemon connected. Start Codex in another terminal with: agentbridge codex",
+        `✅ AgentBridge bridge is ready. Daemon connected. ${readyHint}`,
       ));
     }
   } catch (err: any) {

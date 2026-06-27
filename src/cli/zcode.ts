@@ -96,6 +96,14 @@ export async function runZcode(args: string[]) {
   // (read by ZcodeAdapter.createSession).
   process.env.ZCODE_SESSION_MODE = sessionMode;
 
+  // The user's real cwd, captured BEFORE the chdir workaround below. The daemon
+  // is spawned with cwd=ZCODE_STATE_DIR (~/.abcz) as a bun-spawn workaround and
+  // inherits that cwd; the ZcodeAdapter then spawns the peer with
+  // `ZCODE_WORK_DIR ?? process.cwd()`. Without this, the ZCode peer would run in
+  // ~/.abcz (the state/log dir) instead of the user's project. Mirrors
+  // codex-zcode.ts, which sets the same var.
+  process.env.ZCODE_WORK_DIR = process.cwd();
+
   const stateDir = new StateDirResolver(ZCODE_STATE_DIR);
   stateDir.ensure();
 

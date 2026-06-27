@@ -91,6 +91,14 @@ export async function runKimi(args: string[]) {
     process.env.KIMI_ACP_ARGS = acpPermArg;
   }
 
+  // The user's real cwd, captured BEFORE the chdir workaround below. The daemon
+  // is spawned with cwd=KIMI_STATE_DIR as a bun-spawn workaround and inherits
+  // that cwd; the KimiAdapter then spawns the peer with
+  // `KIMI_WORK_DIR ?? process.cwd()`. Without this, the Kimi peer would run in
+  // the state dir instead of the user's project. Mirrors codex-kimi.ts, which
+  // sets the same var.
+  process.env.KIMI_WORK_DIR = process.cwd();
+
   const stateDir = new StateDirResolver(KIMI_STATE_DIR);
   stateDir.ensure();
 

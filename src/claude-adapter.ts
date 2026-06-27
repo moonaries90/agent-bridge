@@ -76,7 +76,7 @@ export function buildClaudeInstructions(peerName: string): string {
  * reference the correct peer name (Codex/Kimi/ZCode) rather than hardcoding
  * "Codex". Falls back to "Codex" for unset env (legacy behavior).
  */
-function resolvePeerName(env = process.env): string {
+export function resolvePeerName(env = process.env): string {
   const peer = (env.AGENTBRIDGE_PEER ?? "codex").toLowerCase();
   if (peer === "kimi") return "Kimi";
   if (peer === "zcode") return "ZCode";
