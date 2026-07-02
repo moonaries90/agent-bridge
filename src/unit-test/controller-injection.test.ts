@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   dedupePeerTurnContent,
+  selectPeerTurnContent,
   formatControllerInjection,
   buildControllerKickoff,
 } from "../controller-injection";
@@ -45,6 +46,28 @@ describe("dedupePeerTurnContent", () => {
   });
 });
 
+describe("selectPeerTurnContent", () => {
+  test("keeps IMPORTANT final answers and drops same-turn STATUS process logs", () => {
+    expect(selectPeerTurnContent([
+      "[STATUS] I'll inspect the files first.",
+      "[IMPORTANT] Fixed. Tests are green.",
+    ])).toEqual(["[IMPORTANT] Fixed. Tests are green."]);
+  });
+
+  test("drops STATUS process logs when an untagged final answer exists", () => {
+    expect(selectPeerTurnContent([
+      "[STATUS summary - 2 update(s), flushed: turn completed]\nlooked at files",
+      "Done: render.rs updated and verified.",
+    ])).toEqual(["Done: render.rs updated and verified."]);
+  });
+
+  test("keeps STATUS when it is the only useful content", () => {
+    expect(selectPeerTurnContent(["[STATUS] still running", "[FYI] noisy"])).toEqual([
+      "[STATUS] still running",
+    ]);
+  });
+});
+
 describe("formatControllerInjection", () => {
   test("returns null when there is nothing to inject", () => {
     expect(formatControllerInjection("ZCode", [])).toBeNull();
@@ -64,6 +87,14 @@ describe("formatControllerInjection", () => {
   test("coalesces a duplicated peer turn into a single non-redundant injection", () => {
     const out = formatControllerInjection("ZCode", ["hello world", "hello world"]);
     expect(out).toBe("[Message from ZCode]\nhello world");
+  });
+
+  test("does not inject process narration after an IMPORTANT result", () => {
+    const out = formatControllerInjection("ZCode", [
+      "[IMPORTANT] P2.d-5b fixed; self-checks green.",
+      "[STATUS] Let me start by understanding the task.",
+    ]);
+    expect(out).toBe("[Message from ZCode]\n[IMPORTANT] P2.d-5b fixed; self-checks green.");
   });
 });
 

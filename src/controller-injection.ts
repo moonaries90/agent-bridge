@@ -7,6 +7,8 @@
  * testable without spawning a daemon/app-server.
  */
 
+import { parseMarker } from "./message-filter";
+
 /**
  * Collapse the peer messages emitted during a SINGLE peer turn into a minimal,
  * non-redundant list.
@@ -45,12 +47,36 @@ export function dedupePeerTurnContent(parts: string[]): string[] {
 }
 
 /**
+ * Pick the content worth injecting from a single peer turn.
+ *
+ * In Codex-controller mode, `require_reply` forwards live [STATUS] updates
+ * while the peer is working. Those updates are useful only until a final answer
+ * arrives; injecting both makes Codex re-read process narration as fresh input.
+ */
+export function selectPeerTurnContent(parts: string[]): string[] {
+  const annotated = parts
+    .map((raw) => raw.trim())
+    .filter(Boolean)
+    .map((content) => ({ content, marker: parseMarker(content).marker }));
+
+  const important = annotated.filter((part) => part.marker === "important");
+  if (important.length > 0) return important.map((part) => part.content);
+
+  const finalish = annotated.filter((part) => part.marker !== "status" && part.marker !== "fyi");
+  if (finalish.length > 0) return finalish.map((part) => part.content);
+
+  return annotated
+    .filter((part) => part.marker !== "fyi")
+    .map((part) => part.content);
+}
+
+/**
  * Build the single injection string for one peer turn, or null if there is
  * nothing meaningful to inject. The peer name prefix tells the controller Codex
  * the message is from its implementer (not the human user).
  */
 export function formatControllerInjection(peerName: string, parts: string[]): string | null {
-  const deduped = dedupePeerTurnContent(parts);
+  const deduped = dedupePeerTurnContent(selectPeerTurnContent(parts));
   if (deduped.length === 0) return null;
   return `[Message from ${peerName}]\n${deduped.join("\n\n")}`;
 }

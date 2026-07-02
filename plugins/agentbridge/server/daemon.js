@@ -1737,6 +1737,7 @@ class ZcodeAdapter extends EventEmitter3 {
   turnInProgress = false;
   messageBuffer = [];
   statusBuffer = [];
+  latestPartText = "";
   currentSendId = null;
   constructor(logFile = new StateDirResolver().logFile) {
     super();
@@ -1783,6 +1784,7 @@ class ZcodeAdapter extends EventEmitter3 {
         this.currentSendId = null;
         this.messageBuffer = [];
         this.statusBuffer = [];
+        this.latestPartText = "";
         this.emit("turnCompleted");
       }
       if (!this.suppressExitEvent) {
@@ -1818,6 +1820,7 @@ class ZcodeAdapter extends EventEmitter3 {
     this.turnInProgress = true;
     this.messageBuffer = [];
     this.statusBuffer = [];
+    this.latestPartText = "";
     this.emit("turnStarted");
     this.log(`Injecting message into ZCode (${text.length} chars)`);
     const id = this.nextRequestId++;
@@ -1855,6 +1858,7 @@ class ZcodeAdapter extends EventEmitter3 {
     this.turnInProgress = false;
     this.messageBuffer = [];
     this.statusBuffer = [];
+    this.latestPartText = "";
     this.suppressExitEvent = false;
     await this.start();
     this.log(`Session reset complete \u2014 new sessionId=${this.sessionId}`);
@@ -1965,8 +1969,7 @@ class ZcodeAdapter extends EventEmitter3 {
       case "part.upserted": {
         const text = this.extractPartText(payload);
         if (text) {
-          this.messageBuffer.push(text);
-          this.statusBuffer.push(text);
+          this.latestPartText = text;
         }
         break;
       }
@@ -1975,7 +1978,7 @@ class ZcodeAdapter extends EventEmitter3 {
         break;
       case "turn.completed": {
         const response = typeof payload.response === "string" ? payload.response : "";
-        const fullMessage = this.messageBuffer.join("").trim() || response.trim();
+        const fullMessage = response.trim() || this.messageBuffer.join("").trim() || this.latestPartText.trim();
         this.log(`Turn completed (resultType=${payload.resultType ?? "unknown"}, message=${fullMessage.length} chars)`);
         this.flushStatus();
         if (fullMessage.length > 0) {
@@ -1990,6 +1993,7 @@ class ZcodeAdapter extends EventEmitter3 {
         this.currentSendId = null;
         this.messageBuffer = [];
         this.statusBuffer = [];
+        this.latestPartText = "";
         this.emit("turnCompleted");
         break;
       }
@@ -2001,6 +2005,7 @@ class ZcodeAdapter extends EventEmitter3 {
         this.currentSendId = null;
         this.messageBuffer = [];
         this.statusBuffer = [];
+        this.latestPartText = "";
         this.emit("turnCompleted");
         break;
       }
@@ -2730,8 +2735,18 @@ function dedupePeerTurnContent(parts) {
   }
   return out;
 }
+function selectPeerTurnContent(parts) {
+  const annotated = parts.map((raw) => raw.trim()).filter(Boolean).map((content) => ({ content, marker: parseMarker(content).marker }));
+  const important = annotated.filter((part) => part.marker === "important");
+  if (important.length > 0)
+    return important.map((part) => part.content);
+  const finalish = annotated.filter((part) => part.marker !== "status" && part.marker !== "fyi");
+  if (finalish.length > 0)
+    return finalish.map((part) => part.content);
+  return annotated.filter((part) => part.marker !== "fyi").map((part) => part.content);
+}
 function formatControllerInjection(peerName, parts) {
-  const deduped = dedupePeerTurnContent(parts);
+  const deduped = dedupePeerTurnContent(selectPeerTurnContent(parts));
   if (deduped.length === 0)
     return null;
   return `[Message from ${peerName}]
@@ -2847,7 +2862,7 @@ var tuiConnectionState = new TuiConnectionState({
     codex.injectMessage(`\u2705 ${controllerName} is still online, bridge restored. Bidirectional communication can continue.`);
   }
 });
-var statusBuffer = new StatusBuffer((summary) => forwardPeerContent(summary));
+var statusBuffer = new StatusBuffer((summary) => forwardPeerStatus(summary));
 codex.on("turnStarted", () => {
   log(`${peerName} turn started`);
   emitToClaude(systemMessage("system_turn_started", `\u23F3 ${peerName} is working on the current task. Wait for completion before sending a reply.`));
@@ -2862,7 +2877,11 @@ codex.on("agentMessage", (msg) => {
     if (statusBuffer.size > 0) {
       statusBuffer.flush("reply-required message arrived");
     }
-    forwardPeerContent(msg);
+    if (result.marker === "status") {
+      forwardPeerStatus(msg);
+    } else {
+      forwardPeerContent(msg);
+    }
     return;
   }
   if (inAttentionWindow && result.marker === "status") {
@@ -2942,6 +2961,17 @@ codex.on("exit", (code) => {
 function forwardPeerContent(msg) {
   if (controller) {
     controllerTurnBuffer.push(msg.content);
+  } else {
+    emitToClaude(msg);
+  }
+}
+function forwardPeerStatus(msg) {
+  if (controller) {
+    const injection = formatControllerInjection(peerName, [msg.content]);
+    if (injection) {
+      controllerInjectQueue.push(injection);
+      flushControllerQueue();
+    }
   } else {
     emitToClaude(msg);
   }
@@ -3123,9 +3153,6 @@ async function handleControlMessage(ws, raw) {
 ` + bridgeContractReminder;
       if (requireReply) {
         contentWithReminder += replyRequiredInstruction;
-        replyRequired = true;
-        replyReceivedDuringTurn = false;
-        log(`Reply required flag set for this message`);
       }
       log(`Forwarding Claude \u2192 ${peerName} (${content.length} chars, requireReply=${requireReply})`);
       const injected = codex.injectMessage(contentWithReminder);
@@ -3139,6 +3166,11 @@ async function handleControlMessage(ws, raw) {
           error: reason
         });
         return;
+      }
+      if (requireReply) {
+        replyRequired = true;
+        replyReceivedDuringTurn = false;
+        log(`Reply required flag set for accepted message`);
       }
       clearAttentionWindow();
       sendProtocolMessage(ws, {

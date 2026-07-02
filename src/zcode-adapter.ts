@@ -102,6 +102,9 @@ export class ZcodeAdapter extends EventEmitter {
   // tool-call boundaries (tool.updated) as a [STATUS] message to Claude.
   // Not cleared on flush — the final turn.completed message stays complete.
   private statusBuffer: string[] = [];
+  // ZCode can emit repeated part.upserted snapshots. Keep the latest snapshot
+  // only as a fallback; appending snapshots duplicates whole stretches of text.
+  private latestPartText = "";
   private currentSendId: number | string | null = null;
 
   constructor(logFile = new StateDirResolver().logFile) {
@@ -169,6 +172,7 @@ export class ZcodeAdapter extends EventEmitter {
         this.currentSendId = null;
         this.messageBuffer = [];
         this.statusBuffer = [];
+        this.latestPartText = "";
         this.emit("turnCompleted");
       }
       if (!this.suppressExitEvent) {
@@ -221,6 +225,7 @@ export class ZcodeAdapter extends EventEmitter {
     this.turnInProgress = true;
     this.messageBuffer = [];
     this.statusBuffer = [];
+    this.latestPartText = "";
     this.emit("turnStarted");
 
     this.log(`Injecting message into ZCode (${text.length} chars)`);
@@ -283,6 +288,7 @@ export class ZcodeAdapter extends EventEmitter {
     this.turnInProgress = false;
     this.messageBuffer = [];
     this.statusBuffer = [];
+    this.latestPartText = "";
     this.suppressExitEvent = false;
 
     await this.start();
@@ -448,11 +454,10 @@ export class ZcodeAdapter extends EventEmitter {
       case "part.started":
       case "part.upserted": {
         // A part may carry a complete text chunk (non-streaming model, or the
-        // initial render). Capture it if it looks like assistant text.
+        // initial render). Treat it as a snapshot, not a delta.
         const text = this.extractPartText(payload);
         if (text) {
-          this.messageBuffer.push(text);
-          this.statusBuffer.push(text);
+          this.latestPartText = text;
         }
         break;
       }
@@ -466,9 +471,10 @@ export class ZcodeAdapter extends EventEmitter {
 
       case "turn.completed": {
         const response = typeof payload.response === "string" ? payload.response : "";
-        // Prefer the streamed accumulation; fall back to the turn.completed
-        // `payload.response` field if we somehow captured nothing.
-        const fullMessage = this.messageBuffer.join("").trim() || response.trim();
+        // Prefer the authoritative completed response when ZCode provides it.
+        // Streaming deltas feed STATUS, but may contain transient narration or
+        // repeated snapshots on some ZCode builds.
+        const fullMessage = response.trim() || this.messageBuffer.join("").trim() || this.latestPartText.trim();
         this.log(`Turn completed (resultType=${payload.resultType ?? "unknown"}, message=${fullMessage.length} chars)`);
 
         // Flush any trailing narration that never hit a tool boundary.
@@ -487,6 +493,7 @@ export class ZcodeAdapter extends EventEmitter {
         this.currentSendId = null;
         this.messageBuffer = [];
         this.statusBuffer = [];
+        this.latestPartText = "";
         this.emit("turnCompleted");
         break;
       }
@@ -501,6 +508,7 @@ export class ZcodeAdapter extends EventEmitter {
         this.currentSendId = null;
         this.messageBuffer = [];
         this.statusBuffer = [];
+        this.latestPartText = "";
         this.emit("turnCompleted");
         break;
       }

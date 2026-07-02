@@ -169,7 +169,7 @@ const tuiConnectionState = new TuiConnectionState({
   },
 });
 
-const statusBuffer = new StatusBuffer((summary) => forwardPeerContent(summary));
+const statusBuffer = new StatusBuffer((summary) => forwardPeerStatus(summary));
 
 codex.on("turnStarted", () => {
   log(`${peerName} turn started`);
@@ -192,7 +192,11 @@ codex.on("agentMessage", (msg: BridgeMessage) => {
     if (statusBuffer.size > 0) {
       statusBuffer.flush("reply-required message arrived");
     }
-    forwardPeerContent(msg);
+    if (result.marker === "status") {
+      forwardPeerStatus(msg);
+    } else {
+      forwardPeerContent(msg);
+    }
     return;
   }
 
@@ -316,6 +320,21 @@ function forwardPeerContent(msg: BridgeMessage) {
     // peer's turnCompleted (see flushControllerTurnBuffer). Avoids making the
     // controller run a separate turn per intermediate peer message.
     controllerTurnBuffer.push(msg.content);
+  } else {
+    emitToClaude(msg);
+  }
+}
+
+// STATUS delivery for Codex-controller modes is intentionally immediate and
+// excluded from controllerTurnBuffer. Otherwise the controller cannot see live
+// progress until the peer finishes, and the final flush would repeat it.
+function forwardPeerStatus(msg: BridgeMessage) {
+  if (controller) {
+    const injection = formatControllerInjection(peerName, [msg.content]);
+    if (injection) {
+      controllerInjectQueue.push(injection);
+      void flushControllerQueue();
+    }
   } else {
     emitToClaude(msg);
   }
@@ -533,9 +552,6 @@ async function handleControlMessage(ws: ServerWebSocket<ControlSocketData>, raw:
       let contentWithReminder = content + "\n\n" + bridgeContractReminder;
       if (requireReply) {
         contentWithReminder += replyRequiredInstruction;
-        replyRequired = true;
-        replyReceivedDuringTurn = false;
-        log(`Reply required flag set for this message`);
       }
       log(`Forwarding Claude → ${peerName} (${content.length} chars, requireReply=${requireReply})`);
       const injected = codex.injectMessage(contentWithReminder);
@@ -551,6 +567,11 @@ async function handleControlMessage(ws: ServerWebSocket<ControlSocketData>, raw:
           error: reason,
         });
         return;
+      }
+      if (requireReply) {
+        replyRequired = true;
+        replyReceivedDuringTurn = false;
+        log(`Reply required flag set for accepted message`);
       }
       clearAttentionWindow(); // Claude successfully replied, end attention window
       sendProtocolMessage(ws, {
