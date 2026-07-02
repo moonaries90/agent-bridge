@@ -10150,7 +10150,7 @@ function finalize(ctx, schema) {
     result.$schema = "http://json-schema.org/draft-07/schema#";
   } else if (ctx.target === "draft-04") {
     result.$schema = "http://json-schema.org/draft-04/schema#";
-  } else if (ctx.target === "openapi-3.0") {} else {}
+  } else if (ctx.target === "openapi-3.0") {}
   if (ctx.external?.uri) {
     const id = ctx.external.registry.get(schema)?.id;
     if (!id)
@@ -10372,7 +10372,7 @@ var literalProcessor = (schema, ctx, json, _params) => {
     if (val === undefined) {
       if (ctx.unrepresentable === "throw") {
         throw new Error("Literal `undefined` cannot be represented in JSON Schema");
-      } else {}
+      }
     } else if (typeof val === "bigint") {
       if (ctx.unrepresentable === "throw") {
         throw new Error("BigInt literals cannot be represented in JSON Schema");
@@ -13725,6 +13725,111 @@ class StateDirResolver {
   }
 }
 
+// src/message-filter.ts
+var MARKER_REGEX = /^\s*\[(IMPORTANT|STATUS|FYI)(?:\s+[^\]]*)?\]\s*/i;
+var DEFAULT_PULL_MAX_MESSAGE_CHARS = 6000;
+var DEFAULT_PULL_MAX_TOTAL_CHARS = 24000;
+function parseMarker(content) {
+  const match = content.match(MARKER_REGEX);
+  if (!match)
+    return { marker: "untagged", body: content };
+  return {
+    marker: match[1].toLowerCase(),
+    body: content.slice(match[0].length)
+  };
+}
+function resolvePullMessageMode(env = process.env) {
+  return env.AGENTBRIDGE_GET_MESSAGES_MODE === "full" ? "full" : "markers";
+}
+function resolvePullMaxMessageChars(env = process.env) {
+  return parsePositiveInt(env.AGENTBRIDGE_GET_MESSAGES_MAX_MESSAGE_CHARS, DEFAULT_PULL_MAX_MESSAGE_CHARS);
+}
+function resolvePullMaxTotalChars(env = process.env) {
+  return parsePositiveInt(env.AGENTBRIDGE_GET_MESSAGES_MAX_TOTAL_CHARS, DEFAULT_PULL_MAX_TOTAL_CHARS);
+}
+function formatPullMessages(options) {
+  const mode = options.mode ?? resolvePullMessageMode();
+  const maxMessageChars = options.maxMessageChars ?? resolvePullMaxMessageChars();
+  const maxTotalChars = options.maxTotalChars ?? resolvePullMaxTotalChars();
+  const dropped = options.droppedMessageCount ?? 0;
+  const accepted = [];
+  let suppressedByMarker = 0;
+  for (const message of options.messages) {
+    const { marker } = parseMarker(message.content);
+    const shouldInclude = mode === "full" || marker === "important" || marker === "status";
+    if (shouldInclude)
+      accepted.push(message);
+    else
+      suppressedByMarker++;
+  }
+  const count = options.messages.length;
+  let header = `[${count} new message${count > 1 ? "s" : ""} from ${options.peerName}]`;
+  if (dropped > 0) {
+    header += ` (${dropped} older message${dropped > 1 ? "s" : ""} were dropped due to queue overflow)`;
+  }
+  header += `
+chat_id: ${options.sessionId}`;
+  if (mode === "markers") {
+    header += `
+get_messages filter: returning only [IMPORTANT]/[STATUS] messages`;
+  }
+  if (suppressedByMarker > 0) {
+    header += `
+suppressed: ${suppressedByMarker} unmarked/[FYI] message${suppressedByMarker > 1 ? "s" : ""}`;
+  }
+  const parts = [];
+  let omittedBySize = 0;
+  let usedChars = header.length + 2;
+  for (let i = 0;i < accepted.length; i++) {
+    const msg = accepted[i];
+    const ts = new Date(msg.timestamp).toISOString();
+    const prefix = `---
+[${i + 1}] ${ts}
+${options.peerName}: `;
+    const fixedCost = prefix.length + 2;
+    const remaining = maxTotalChars - usedChars - fixedCost;
+    if (remaining < 200) {
+      omittedBySize = accepted.length - i;
+      break;
+    }
+    const contentBudget = Math.max(200, Math.min(maxMessageChars, remaining));
+    const content = truncateMiddle(msg.content, contentBudget);
+    const part = `${prefix}${content}`;
+    parts.push(part);
+    usedChars += part.length + 2;
+  }
+  if (omittedBySize > 0) {
+    parts.push(`[suppressed: ${omittedBySize} additional message${omittedBySize > 1 ? "s" : ""} due to get_messages size limit]`);
+  }
+  if (parts.length === 0 && suppressedByMarker > 0) {
+    parts.push("[no marker-qualified messages to return]");
+  }
+  return `${header}
+
+${parts.join(`
+
+`)}`;
+}
+function parsePositiveInt(value, fallback) {
+  if (!value)
+    return fallback;
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+function truncateMiddle(content, maxChars) {
+  if (content.length <= maxChars)
+    return content;
+  const notice = `
+[... truncated ${content.length - maxChars} chars by get_messages safety limit ...]
+`;
+  if (maxChars <= notice.length + 20)
+    return content.slice(0, maxChars);
+  const available = maxChars - notice.length;
+  const headChars = Math.ceil(available * 0.7);
+  const tailChars = available - headChars;
+  return `${content.slice(0, headChars)}${notice}${content.slice(content.length - tailChars)}`;
+}
+
 // src/claude-adapter.ts
 function buildClaudeInstructions(peerName) {
   const peerLower = peerName.toLowerCase();
@@ -13896,28 +14001,17 @@ class ClaudeAdapter extends EventEmitter {
     const dropped = this.droppedMessageCount;
     this.droppedMessageCount = 0;
     const count = messages.length;
-    let header = `[${count} new message${count > 1 ? "s" : ""} from ${this.peerName}]`;
-    if (dropped > 0) {
-      header += ` (${dropped} older message${dropped > 1 ? "s" : ""} were dropped due to queue overflow)`;
-    }
-    header += `
-chat_id: ${this.sessionId}`;
-    const formatted = messages.map((msg, i) => {
-      const ts = new Date(msg.timestamp).toISOString();
-      return `---
-[${i + 1}] ${ts}
-${this.peerName}: ${msg.content}`;
-    }).join(`
-
-`);
     this.log(`get_messages returning ${count} message(s) (instance=${this.instanceId}, dropped=${dropped})`);
     return {
       content: [
         {
           type: "text",
-          text: `${header}
-
-${formatted}`
+          text: formatPullMessages({
+            peerName: this.peerName,
+            sessionId: this.sessionId,
+            messages,
+            droppedMessageCount: dropped
+          })
         }
       ]
     };

@@ -32,6 +32,7 @@ import { DaemonClient } from "./daemon-client";
 import { DaemonLifecycle } from "./daemon-lifecycle";
 import { StateDirResolver } from "./state-dir";
 import { disabledReplyError, type BridgeDisabledReason } from "./bridge-disabled-state";
+import { formatPullMessages } from "./message-filter";
 import type { BridgeMessage } from "./types";
 
 /**
@@ -78,7 +79,8 @@ function buildCodexInstructions(peer: string): string {
     `## Receiving ${peer} replies (real-time — no polling)`,
     `${peer}'s replies are injected directly into THIS conversation as new messages prefixed "[Message from ${peer}]", in real time as they happen.`,
     `- You do NOT need to call get_messages — replies arrive automatically.`,
-    `- get_messages remains only as a fallback and is normally empty.`,
+    `- get_messages is replay/fallback only: use it only when more than 30 minutes have passed since your reply, no injected "[Message from ${peer}]" arrived, and ${peer} is no longer busy.`,
+    `- If less than 30 minutes have passed, or ${peer} is still busy, be patient and do not use pull mode.`,
     "",
     "## How to interact",
     `- Use the \`reply\` tool to send a message to ${peer} — pass chat_id back.`,
@@ -87,6 +89,7 @@ function buildCodexInstructions(peer: string): string {
     "",
     "## Turn coordination",
     `- If \`reply\` returns a busy error, ${peer} is still executing — stop and wait; the result will arrive as an injected message (do not poll).`,
+    `- ${peer} may take a long time to implement, run tests, or inspect files. Slow response is normal; wait patiently instead of repeatedly checking pull mode.`,
     `- One exchange = one of your turns: read ${peer}'s injected message, decide, send one \`reply\`, then stop.`,
     "",
     "## Context management",
@@ -234,7 +237,7 @@ async function handleReply(args: Record<string, unknown>) {
     content: [
       {
         type: "text" as const,
-        text: `Reply sent to ${peerName}. Its response will arrive automatically as a new "[Message from ${peerName}]" message — END YOUR TURN and wait. Do NOT poll get_messages: while you stay busy the reply cannot be injected.`,
+        text: `Reply sent to ${peerName}. Its response will arrive automatically as a new "[Message from ${peerName}]" message — END YOUR TURN and wait patiently. Do NOT poll get_messages unless more than 30 minutes have passed, no injected reply arrived, and ${peerName} is no longer busy.`,
       },
     ],
   };
@@ -250,22 +253,16 @@ function drainMessages(): { content: Array<{ type: "text"; text: string }> } {
   const dropped = droppedMessageCount;
   droppedMessageCount = 0;
 
-  const count = messages.length;
-  let header = `[${count} new message${count > 1 ? "s" : ""} from ${peerName}]`;
-  if (dropped > 0) {
-    header += ` (${dropped} older message${dropped > 1 ? "s" : ""} were dropped due to queue overflow)`;
-  }
-  header += `\nchat_id: ${sessionId}`;
-
-  const formatted = messages
-    .map((msg, i) => {
-      const ts = new Date(msg.timestamp).toISOString();
-      return `---\n[${i + 1}] ${ts}\n${peerName}: ${msg.content}`;
-    })
-    .join("\n\n");
-
   return {
-    content: [{ type: "text" as const, text: `${header}\n\n${formatted}` }],
+    content: [{
+      type: "text" as const,
+      text: formatPullMessages({
+        peerName,
+        sessionId,
+        messages,
+        droppedMessageCount: dropped,
+      }),
+    }],
   };
 }
 

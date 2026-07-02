@@ -4,6 +4,7 @@ import {
   buildReplyRequiredInstruction,
   StatusBuffer,
   classifyMessage,
+  formatPullMessages,
   parseMarker,
 } from "../message-filter";
 import type { BridgeMessage } from "../types";
@@ -41,6 +42,12 @@ describe("parseMarker", () => {
     expect(r.body).toBe("plain message");
   });
 
+  test("does not treat marker-like words as markers", () => {
+    const r = parseMarker("[IMPORTANTLY] not a marker");
+    expect(r.marker).toBe("untagged");
+    expect(r.body).toBe("[IMPORTANTLY] not a marker");
+  });
+
   test("handles leading whitespace before marker", () => {
     const r = parseMarker("  [STATUS] progress");
     expect(r.marker).toBe("status");
@@ -74,6 +81,91 @@ describe("classifyMessage", () => {
   test("forwards everything in full mode", () => {
     expect(classifyMessage("[FYI] x", "full")).toEqual({ action: "forward", marker: "untagged" });
     expect(classifyMessage("[STATUS] x", "full")).toEqual({ action: "forward", marker: "untagged" });
+  });
+});
+
+describe("formatPullMessages", () => {
+  test("returns only IMPORTANT and STATUS messages in marker mode", () => {
+    const text = formatPullMessages({
+      peerName: "ZCode",
+      sessionId: "codex_1",
+      messages: [
+        makeMsg("plain verbose output", 1705312200000),
+        makeMsg("[FYI] background detail", 1705312201000),
+        makeMsg("[STATUS] still running", 1705312202000),
+        makeMsg("[IMPORTANT] ready", 1705312203000),
+      ],
+      mode: "markers",
+    });
+
+    expect(text).toContain("[4 new messages from ZCode]");
+    expect(text).toContain("get_messages filter: returning only [IMPORTANT]/[STATUS] messages");
+    expect(text).toContain("suppressed: 2 unmarked/[FYI] messages");
+    expect(text).toContain("[STATUS] still running");
+    expect(text).toContain("[IMPORTANT] ready");
+    expect(text).not.toContain("plain verbose output");
+    expect(text).not.toContain("background detail");
+  });
+
+  test("treats STATUS summary headers as STATUS messages", () => {
+    const text = formatPullMessages({
+      peerName: "ZCode",
+      sessionId: "codex_1",
+      messages: [
+        makeMsg("[STATUS summary - 2 update(s), flushed: turn completed]\none\ntwo", 1705312200000),
+      ],
+      mode: "markers",
+    });
+
+    expect(text).toContain("[STATUS summary - 2 update(s)");
+    expect(text).toContain("one");
+    expect(text).toContain("two");
+  });
+
+  test("full mode returns unmarked messages for debugging", () => {
+    const text = formatPullMessages({
+      peerName: "ZCode",
+      sessionId: "codex_1",
+      messages: [makeMsg("plain verbose output", 1705312200000)],
+      mode: "full",
+    });
+
+    expect(text).toContain("plain verbose output");
+    expect(text).not.toContain("get_messages filter");
+  });
+
+  test("truncates oversized messages by preserving beginning and end", () => {
+    const text = formatPullMessages({
+      peerName: "ZCode",
+      sessionId: "codex_1",
+      messages: [makeMsg(`[IMPORTANT] ${"A".repeat(120)} MIDDLE ${"Z".repeat(120)}`, 1705312200000)],
+      mode: "markers",
+      maxMessageChars: 120,
+      maxTotalChars: 1000,
+    });
+
+    expect(text).toContain("[IMPORTANT]");
+    expect(text).toContain("AAAA");
+    expect(text).toContain("ZZZZ");
+    expect(text).toContain("truncated");
+    expect(text).not.toContain("MIDDLE");
+  });
+
+  test("omits additional marker messages past the total output limit", () => {
+    const text = formatPullMessages({
+      peerName: "ZCode",
+      sessionId: "codex_1",
+      messages: [
+        makeMsg(`[IMPORTANT] ${"a".repeat(200)}`, 1705312200000),
+        makeMsg(`[IMPORTANT] ${"b".repeat(200)}`, 1705312201000),
+        makeMsg(`[IMPORTANT] ${"c".repeat(200)}`, 1705312202000),
+      ],
+      mode: "markers",
+      maxMessageChars: 200,
+      maxTotalChars: 520,
+    });
+
+    expect(text).toContain("due to get_messages size limit");
   });
 });
 

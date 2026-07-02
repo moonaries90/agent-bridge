@@ -75,5 +75,8 @@ describe("buildControllerKickoff", () => {
     expect(k).toContain("no polling");
     expect(k).toContain("[Message from ZCode]");
     expect(k.toLowerCase()).toContain("reply");
+    expect(k).toContain("30 minutes");
+    expect(k).toContain("busy");
+    expect(k).toContain("replay/fallback");
   });
 });

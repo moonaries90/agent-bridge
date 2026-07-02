@@ -2,13 +2,16 @@ import type { BridgeMessage } from "./types";
 
 export type MarkerLevel = "important" | "status" | "fyi" | "untagged";
 export type FilterMode = "filtered" | "full";
+export type PullMessageMode = "markers" | "full";
 
 export interface FilterResult {
   action: "forward" | "buffer" | "drop";
   marker: MarkerLevel;
 }
 
-const MARKER_REGEX = /^\s*\[(IMPORTANT|STATUS|FYI)\]\s*/i;
+const MARKER_REGEX = /^\s*\[(IMPORTANT|STATUS|FYI)(?:\s+[^\]]*)?\]\s*/i;
+const DEFAULT_PULL_MAX_MESSAGE_CHARS = 6_000;
+const DEFAULT_PULL_MAX_TOTAL_CHARS = 24_000;
 
 export function parseMarker(content: string): { marker: MarkerLevel; body: string } {
   const match = content.match(MARKER_REGEX);
@@ -32,6 +35,103 @@ export function classifyMessage(content: string, mode: FilterMode): FilterResult
     case "untagged":
       return { action: "forward", marker };
   }
+}
+
+export interface PullMessageFormatOptions {
+  peerName: string;
+  sessionId: string;
+  messages: BridgeMessage[];
+  droppedMessageCount?: number;
+  mode?: PullMessageMode;
+  maxMessageChars?: number;
+  maxTotalChars?: number;
+}
+
+export function resolvePullMessageMode(env = process.env): PullMessageMode {
+  return env.AGENTBRIDGE_GET_MESSAGES_MODE === "full" ? "full" : "markers";
+}
+
+export function resolvePullMaxMessageChars(env = process.env): number {
+  return parsePositiveInt(env.AGENTBRIDGE_GET_MESSAGES_MAX_MESSAGE_CHARS, DEFAULT_PULL_MAX_MESSAGE_CHARS);
+}
+
+export function resolvePullMaxTotalChars(env = process.env): number {
+  return parsePositiveInt(env.AGENTBRIDGE_GET_MESSAGES_MAX_TOTAL_CHARS, DEFAULT_PULL_MAX_TOTAL_CHARS);
+}
+
+export function formatPullMessages(options: PullMessageFormatOptions): string {
+  const mode = options.mode ?? resolvePullMessageMode();
+  const maxMessageChars = options.maxMessageChars ?? resolvePullMaxMessageChars();
+  const maxTotalChars = options.maxTotalChars ?? resolvePullMaxTotalChars();
+  const dropped = options.droppedMessageCount ?? 0;
+
+  const accepted: BridgeMessage[] = [];
+  let suppressedByMarker = 0;
+  for (const message of options.messages) {
+    const { marker } = parseMarker(message.content);
+    const shouldInclude = mode === "full" || marker === "important" || marker === "status";
+    if (shouldInclude) accepted.push(message);
+    else suppressedByMarker++;
+  }
+
+  const count = options.messages.length;
+  let header = `[${count} new message${count > 1 ? "s" : ""} from ${options.peerName}]`;
+  if (dropped > 0) {
+    header += ` (${dropped} older message${dropped > 1 ? "s" : ""} were dropped due to queue overflow)`;
+  }
+  header += `\nchat_id: ${options.sessionId}`;
+  if (mode === "markers") {
+    header += `\nget_messages filter: returning only [IMPORTANT]/[STATUS] messages`;
+  }
+  if (suppressedByMarker > 0) {
+    header += `\nsuppressed: ${suppressedByMarker} unmarked/[FYI] message${suppressedByMarker > 1 ? "s" : ""}`;
+  }
+
+  const parts: string[] = [];
+  let omittedBySize = 0;
+  let usedChars = header.length + 2;
+
+  for (let i = 0; i < accepted.length; i++) {
+    const msg = accepted[i];
+    const ts = new Date(msg.timestamp).toISOString();
+    const prefix = `---\n[${i + 1}] ${ts}\n${options.peerName}: `;
+    const fixedCost = prefix.length + 2;
+    const remaining = maxTotalChars - usedChars - fixedCost;
+    if (remaining < 200) {
+      omittedBySize = accepted.length - i;
+      break;
+    }
+    const contentBudget = Math.max(200, Math.min(maxMessageChars, remaining));
+    const content = truncateMiddle(msg.content, contentBudget);
+    const part = `${prefix}${content}`;
+    parts.push(part);
+    usedChars += part.length + 2;
+  }
+
+  if (omittedBySize > 0) {
+    parts.push(`[suppressed: ${omittedBySize} additional message${omittedBySize > 1 ? "s" : ""} due to get_messages size limit]`);
+  }
+  if (parts.length === 0 && suppressedByMarker > 0) {
+    parts.push("[no marker-qualified messages to return]");
+  }
+
+  return `${header}\n\n${parts.join("\n\n")}`;
+}
+
+function parsePositiveInt(value: string | undefined, fallback: number): number {
+  if (!value) return fallback;
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function truncateMiddle(content: string, maxChars: number): string {
+  if (content.length <= maxChars) return content;
+  const notice = `\n[... truncated ${content.length - maxChars} chars by get_messages safety limit ...]\n`;
+  if (maxChars <= notice.length + 20) return content.slice(0, maxChars);
+  const available = maxChars - notice.length;
+  const headChars = Math.ceil(available * 0.7);
+  const tailChars = available - headChars;
+  return `${content.slice(0, headChars)}${notice}${content.slice(content.length - tailChars)}`;
 }
 
 /**

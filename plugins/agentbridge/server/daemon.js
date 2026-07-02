@@ -2137,7 +2137,7 @@ class ZcodeAdapter extends EventEmitter3 {
 }
 
 // src/message-filter.ts
-var MARKER_REGEX = /^\s*\[(IMPORTANT|STATUS|FYI)\]\s*/i;
+var MARKER_REGEX = /^\s*\[(IMPORTANT|STATUS|FYI)(?:\s+[^\]]*)?\]\s*/i;
 function parseMarker(content) {
   const match = content.match(MARKER_REGEX);
   if (!match)
@@ -2746,10 +2746,13 @@ function buildControllerKickoff(peer) {
     `## Receiving ${peer} (real-time \u2014 no polling)`,
     `- ${peer}'s replies are injected directly into THIS conversation as new messages prefixed "[Message from ${peer}]".`,
     `- You do NOT need to call get_messages \u2014 replies arrive automatically as they happen.`,
+    `- After assigning work, be patient. ${peer} may take a long time to implement, run commands, or inspect files.`,
+    `- Do not use pull mode while less than 30 minutes have passed or ${peer} is still busy.`,
+    `- Use get_messages only as replay/fallback when more than 30 minutes have passed, no injected reply arrived, and ${peer} is no longer busy.`,
     "",
     "## Sending",
     `- Use the \`reply\` tool to send a message to ${peer}; it is injected into ${peer}'s session as a new user turn.`,
-    `- If \`reply\` returns busy, ${peer} is mid-turn \u2014 wait and retry.`,
+    `- If \`reply\` returns busy, ${peer} is mid-turn \u2014 stop and wait; do not repeatedly poll.`,
     "",
     "## Your role",
     `- Plan and decompose the task; delegate concrete implementation/testing to ${peer}; review its output before moving on.`,

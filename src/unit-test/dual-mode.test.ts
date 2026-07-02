@@ -177,8 +177,8 @@ describe("Dual-mode transport: drainMessages (get_messages)", () => {
     adapter.resolveMode();
 
     const ts = 1705312200000; // fixed timestamp for deterministic output
-    adapter.queueForPull(makeBridgeMessage("first message", ts));
-    adapter.queueForPull(makeBridgeMessage("second message", ts + 5000));
+    adapter.queueForPull(makeBridgeMessage("[IMPORTANT] first message", ts));
+    adapter.queueForPull(makeBridgeMessage("[STATUS] second message", ts + 5000));
 
     const result = adapter.drainMessages();
     const text = result.content[0].text;

@@ -22,6 +22,7 @@ import { EventEmitter } from "node:events";
 import { randomUUID } from "node:crypto";
 import { appendFileSync } from "node:fs";
 import { StateDirResolver } from "./state-dir";
+import { formatPullMessages } from "./message-filter";
 import type { BridgeMessage } from "./types";
 
 export type ReplySender = (msg: BridgeMessage, requireReply?: boolean) => Promise<{ success: boolean; error?: string }>;
@@ -237,27 +238,19 @@ export class ClaudeAdapter extends EventEmitter {
     this.pendingMessages = [];
     const dropped = this.droppedMessageCount;
     this.droppedMessageCount = 0;
-
     const count = messages.length;
-    let header = `[${count} new message${count > 1 ? "s" : ""} from ${this.peerName}]`;
-    if (dropped > 0) {
-      header += ` (${dropped} older message${dropped > 1 ? "s" : ""} were dropped due to queue overflow)`;
-    }
-    header += `\nchat_id: ${this.sessionId}`;
-
-    const formatted = messages
-      .map((msg, i) => {
-        const ts = new Date(msg.timestamp).toISOString();
-        return `---\n[${i + 1}] ${ts}\n${this.peerName}: ${msg.content}`;
-      })
-      .join("\n\n");
 
     this.log(`get_messages returning ${count} message(s) (instance=${this.instanceId}, dropped=${dropped})`);
     return {
       content: [
         {
           type: "text" as const,
-          text: `${header}\n\n${formatted}`,
+          text: formatPullMessages({
+            peerName: this.peerName,
+            sessionId: this.sessionId,
+            messages,
+            droppedMessageCount: dropped,
+          }),
         },
       ],
     };
